@@ -36,7 +36,7 @@
 ### Owner A Queue (`plans/OWNER_A_WORKBOOK.md`)
 | ID | Task | Status | Depends On | Target Files |
 |---|---|---|---|---|
-| `A-01` | Unified `ModelAdapter` (OpenAI/Gemini/Anthropic) + `ResumeFileAdapter` (PDF/DOCX) | `TODO` | `S-01` | `app/adapters_pipeline.py`, `app/routes_pipeline.py`, `web/pipeline.js` |
+| `A-01` | Unified `ModelAdapter` (OpenAI/Gemini/Anthropic) + `ResumeFileAdapter` (PDF/DOCX) | `DONE` | `S-01` | `app/adapters_pipeline.py`, `app/routes_pipeline.py`, `web/pipeline.js`, `tests/test_pipeline.py` · See `comms/handoffs/H-02-model-resume-adapters.md` |
 | `A-02` | `JobDiscoveryAdapter` (Greenhouse/Lever/Ashby) + **D1** Pre-Flight Shield | `TODO` | `A-01` | `app/engine.py`, `app/adapters_pipeline.py`, `app/routes_pipeline.py`, `web/pipeline.js` |
 | `A-03` | **D3** Co-Pilot Packet + Sensitive-Field Gate + SHA-256 Receipts | `TODO` | `A-01` | `app/adapters_pipeline.py`, `app/routes_pipeline.py`, `web/pipeline.js` |
 | `A-04` | **D2** Voice-Preserving Anti-Slop Tailor + ATS Plain-Text Preview | `TODO` | `A-01` | `app/engine.py`, `app/adapters_pipeline.py`, `web/pipeline.js` |
