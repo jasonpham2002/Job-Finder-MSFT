@@ -160,6 +160,18 @@
       <div id="pipelineCopilotWorkspace" style="display:none;margin-top:8px;">
         <div id="pipelineCopilotSections"></div>
 
+        <div class="fit" style="margin-top:8px;border-left:4px solid #2563eb;background:#f8fbff;">
+          <div style="display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:8px;">
+            <strong>A-06 Optional Headed Playwright HITL Autofill (Non-Sensitive Fields Only)</strong>
+            <button id="pipelineHitlAutofillBtn" type="button" class="secondary">Launch HITL Autofill / Selector Plan</button>
+          </div>
+          <label class="small" style="display:block;margin-top:6px;">
+            <input id="pipelineHitlApproval" type="checkbox">
+            I explicitly approve opening the target portal (when enabled) to pre-fill ONLY non-sensitive fields. Sensitive fields stay locked and I remain in control of login, CAPTCHAs, and Submit.
+          </label>
+          <div id="pipelineHitlStatusBox" class="small muted" style="margin-top:6px;">Degrades gracefully to D3 Co-Pilot field cards when Playwright HITL is disabled or not installed.</div>
+        </div>
+
         <div class="fit" style="margin-top:10px;border-left:4px solid #b45309;">
           <strong>LOCKED Sensitive Eligibility &amp; EEO Gate (AI Never Auto-Fills)</strong>
           <p class="small">Enter or explicitly decline each field yourself before recording any real application.</p>
@@ -241,6 +253,24 @@
       <div id="pipelineGapWorkspace" style="margin-top:10px;"></div>
       <div id="pipelineCallbackWorkspace" style="margin-top:10px;"></div>
     </div>
+    <div style="border-top:1px solid #d9e1ea;padding-top:10px;margin-top:12px;">
+      <div style="display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:8px;">
+        <div>
+          <strong>A-07 10-Job Pipeline &amp; Live Submission Readiness Scorecard</strong>
+          <span id="pipelineReadinessBadge"></span>
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;">
+          <select id="pipelineBatchMode" aria-label="Batch preparation mode" style="width:auto;min-width:170px;">
+            <option value="heuristic">Batch Mode: Deterministic Offline</option>
+            <option value="auto">Batch Mode: Auto (LLM if configured)</option>
+          </select>
+          <button id="pipelineBatchQueueBtn" type="button">Queue &amp; Prepare 10-Role Pipeline</button>
+          <button id="pipelineRefreshReadinessBtn" type="button" class="secondary">Refresh Scorecard</button>
+        </div>
+      </div>
+      <div id="pipelineReadinessStatus" class="muted" style="margin-top:6px;">Verify all 10 roles have D1 Pre-Flight, D2 Tailored Claims, D3 Co-Pilot Packets, D5 Gaps, and honest real vs. demo receipt counts.</div>
+      <div id="pipelineReadinessWorkspace" style="margin-top:10px;"></div>
+    </div>
   `;
 
   const statusPill = document.getElementById('pipelineStatusPill');
@@ -305,11 +335,122 @@
   const gapStatusEl = document.getElementById('pipelineGapStatus');
   const gapWorkspaceEl = document.getElementById('pipelineGapWorkspace');
   const callbackWorkspaceEl = document.getElementById('pipelineCallbackWorkspace');
+  const hitlAutofillBtn = document.getElementById('pipelineHitlAutofillBtn');
+  const hitlApprovalEl = document.getElementById('pipelineHitlApproval');
+  const hitlStatusBox = document.getElementById('pipelineHitlStatusBox');
+  const batchModeEl = document.getElementById('pipelineBatchMode');
+  const batchQueueBtn = document.getElementById('pipelineBatchQueueBtn');
+  const refreshReadinessBtn = document.getElementById('pipelineRefreshReadinessBtn');
+  const readinessBadgeEl = document.getElementById('pipelineReadinessBadge');
+  const readinessStatusEl = document.getElementById('pipelineReadinessStatus');
+  const readinessWorkspaceEl = document.getElementById('pipelineReadinessWorkspace');
 
   let pendingFallbackUrl = '';
   let activeCopilotAppId = null;
   let activeTailorAppId = null;
   let lastTailorReport = null;
+
+  function renderHitlResult(hitl) {
+    if (!hitlStatusBox) return;
+    if (!hitl || typeof hitl !== 'object') {
+      hitlStatusBox.textContent = 'Degrades gracefully to D3 Co-Pilot field cards when Playwright HITL is disabled or not installed.';
+      return;
+    }
+    const modeLabel = hitl.mode === 'playwright_hitl'
+      ? badgeHtml(`Headed Playwright (${esc(hitl.ats_family)})`, 'good')
+      : badgeHtml(`D3 Co-Pilot Fallback (${esc(hitl.ats_family)})`, 'warn');
+    const filled = Array.isArray(hitl.filled_fields) ? hitl.filled_fields : [];
+    const locked = Array.isArray(hitl.locked_sensitive_fields) ? hitl.locked_sensitive_fields : [];
+    const plan = Array.isArray(hitl.non_sensitive_field_plan) ? hitl.non_sensitive_field_plan : [];
+    const steps = Array.isArray(hitl.manual_steps_remaining) ? hitl.manual_steps_remaining : [];
+    const reasonHtml = hitl.fallback_reason ? `<div class="small" style="margin-top:4px;">${esc(hitl.fallback_reason)}</div>` : '';
+    const planHtml = plan.length
+      ? `<div class="small" style="margin-top:4px;"><strong>Non-Sensitive Targets (${plan.length}):</strong> ${plan.map((p) => `${esc(p.field_key)}`).join(', ')}</div>`
+      : '';
+    const stepsHtml = steps.length
+      ? `<ul style="margin:4px 0 0 16px;padding:0;">${steps.map((s) => `<li class="small">${esc(s)}</li>`).join('')}</ul>`
+      : '';
+    hitlStatusBox.innerHTML = `
+      <div>${modeLabel} ${badgeHtml(`Filled: ${filled.length}`, filled.length ? 'good' : 'neutral')} ${badgeHtml(`Locked Sensitive: ${locked.length}`, 'warn')} ${badgeHtml('Auto-Submit: OFF', 'good')}</div>
+      ${reasonHtml}
+      ${planHtml}
+      ${stepsHtml}
+    `;
+  }
+
+  function renderReadinessData(data) {
+    if (!readinessWorkspaceEl || !data) return;
+    const target = Number(data.target_real_applications || 10);
+    const prepCount = Number(data.prepared_applications_count || 0);
+    const realCount = Number(data.confirmed_real_submissions_count || 0);
+    const demoCount = Number(data.demo_test_submissions_count || 0);
+    const gapVer = Number(data.gap_artifacts_verified || 0);
+    if (readinessBadgeEl) {
+      readinessBadgeEl.innerHTML = badgeHtml(`Pipeline: ${prepCount}/${target}`, prepCount >= target ? 'good' : 'warn')
+        + badgeHtml(`Verified Real: ${realCount}/${target}`, realCount >= target ? 'good' : 'neutral')
+        + badgeHtml(`Demo Isolated: ${demoCount}`, 'neutral')
+        + badgeHtml(`Gap Proofs: ${gapVer}`, gapVer ? 'good' : 'neutral');
+    }
+    if (readinessStatusEl) {
+      readinessStatusEl.textContent = `Jobs: ${data.total_jobs || 0} (${data.real_public_jobs_count || 0} real public, ${data.fictional_jobs_count || 0} fictional/demo) | Pre-Flight: ${data.preflight_evaluated_count || 0} | Anti-Slop Claims: ${data.tailored_with_claim_map_count || 0} | Co-Pilot: ${data.copilot_staged_count || 0} | Callback Sheets: ${data.callback_ready_count || 0}`;
+    }
+    const rows = Array.isArray(data.applications_audit) ? data.applications_audit : [];
+    if (!rows.length) {
+      readinessWorkspaceEl.innerHTML = '<div class="small muted">No prepared applications yet. Click "Queue & Prepare 10-Role Pipeline" to prepare up to 10 roles with D1–D5 artifacts.</div>';
+      return;
+    }
+    const rowsHtml = rows.slice(0, 15).map((r) => {
+      const statusTone = r.counts_toward_real_10
+        ? 'good'
+        : (r.status === 'test_submitted' || r.status === 'manual_required' ? 'warn' : 'neutral');
+      const checks = [
+        r.has_claim_map ? 'Claims' : null,
+        r.has_ats_preview ? 'ATS' : null,
+        r.has_copilot_packet ? 'CoPilot' : null,
+        r.has_callback_packet ? 'Callback' : null,
+        r.has_sha256_receipt ? 'SHA256' : null,
+      ].filter(Boolean).join(' · ');
+      return `
+        <tr>
+          <td class="small">#${esc(r.application_id)}</td>
+          <td class="small"><strong>${esc(r.title)}</strong><br><span class="muted">${esc(r.company)} (${esc(r.ats_family)})</span></td>
+          <td class="small">${badgeHtml(r.status, statusTone)} ${r.is_fictional ? badgeHtml('Demo', 'neutral') : badgeHtml('Real URL', 'good')}</td>
+          <td class="small">${esc(r.fit_score)}%</td>
+          <td class="small">${esc(checks || 'draft')}</td>
+          <td class="small">${r.counts_toward_real_10 ? badgeHtml(`Ref: ${r.confirmation_reference}`, 'good') : '<span class="muted">Pending real confirm</span>'}</td>
+        </tr>
+      `;
+    }).join('');
+    readinessWorkspaceEl.innerHTML = `
+      <div style="overflow-x:auto;border:1px solid #d9e1ea;border-radius:8px;background:#fff;padding:6px;">
+        <table style="width:100%;border-collapse:collapse;">
+          <thead>
+            <tr style="text-align:left;border-bottom:1px solid #e2e8f0;">
+              <th class="small">App</th>
+              <th class="small">Role &amp; ATS</th>
+              <th class="small">Status &amp; Origin</th>
+              <th class="small">Fit</th>
+              <th class="small">D1–D5 Artifacts</th>
+              <th class="small">Real 10-App Receipt</th>
+            </tr>
+          </thead>
+          <tbody>${rowsHtml}</tbody>
+        </table>
+      </div>
+    `;
+  }
+
+  async function renderReadinessScorecard() {
+    if (!readinessWorkspaceEl) return;
+    try {
+      const resp = await fetch('/api/pipeline/readiness');
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.error || 'Could not load readiness');
+      renderReadinessData(data);
+    } catch (_err) {
+      readinessWorkspaceEl.innerHTML = '<div class="small muted">Pipeline readiness scorecard unavailable.</div>';
+    }
+  }
 
   function renderGapReport(data) {
     if (!gapWorkspaceEl) return;
@@ -682,8 +823,11 @@
         : 'LLM: offline';
       const serperLabel = d.serper_configured ? 'Serper: ready' : 'Serper: ATS-only';
       const copilotLabel = a.requires_explicit_approval ? 'D3 Co-Pilot: ready' : 'D3: pending';
+      const hitlLabel = a.playwright_hitl_enabled
+        ? (a.playwright_available ? 'HITL: ready' : 'HITL: fallback')
+        : 'HITL: safe-fallback';
       const gapLabel = g.implemented ? 'D5: ready' : 'D5: pending';
-      statusPill.textContent = `${llmLabel} | ${serperLabel} | ${copilotLabel} | ${gapLabel}`;
+      statusPill.textContent = `${llmLabel} | ${serperLabel} | ${copilotLabel} | ${hitlLabel} | ${gapLabel}`;
     } catch (_err) {
       statusPill.textContent = 'Pipeline status unavailable';
     }
@@ -1065,6 +1209,7 @@
       renderCopilotPacket(result.application, result.copilot_packet);
       if (typeof reload === 'function') await reload();
       await renderReceiptLedger();
+      await renderReadinessScorecard();
       copilotAppSelect.value = String(result.application.id);
       showNotice(`Built D3 Co-Pilot Packet for App #${result.application.id}.`);
     } catch (err) {
@@ -1130,6 +1275,7 @@
       });
       if (typeof reload === 'function') await reload();
       await renderReceiptLedger();
+      await renderReadinessScorecard();
       if (result.application && result.application.copilot_packet) {
         renderCopilotPacket(result.application, result.application.copilot_packet);
       }
@@ -1195,6 +1341,7 @@
         showNotice('AI Anti-Slop Tailor completed with verified claim trace.');
         if (typeof reload === 'function') await reload();
         await renderReceiptLedger();
+        await renderReadinessScorecard();
       } catch (err) {
         if (tailorStatusEl) tailorStatusEl.textContent = `Error: ${err.message}`;
         showNotice(`Anti-Slop Tailor failed: ${err.message}`);
@@ -1377,12 +1524,87 @@
     });
   }
 
+  if (hitlAutofillBtn) {
+    hitlAutofillBtn.addEventListener('click', async () => {
+      const targetAppId = activeCopilotAppId || activeTailorAppId || (copilotAppSelect && copilotAppSelect.value ? Number(copilotAppSelect.value) : null);
+      if (!targetAppId) {
+        showNotice('Prepare or load a Co-Pilot Packet first before launching HITL Autofill.');
+        return;
+      }
+      if (!hitlApprovalEl || !hitlApprovalEl.checked) {
+        showNotice('Check the explicit HITL approval box before launching autofill.');
+        return;
+      }
+      hitlAutofillBtn.disabled = true;
+      try {
+        const data = await postJson(`/api/pipeline/applications/${Number(targetAppId)}/hitl-autofill`, {
+          explicit_user_approval: true,
+          candidate_answers: collectCandidateAnswersFromDom(),
+        });
+        renderHitlResult(data.hitl_session);
+        showNotice(
+          data.hitl_session.mode === 'playwright_hitl'
+            ? `Playwright HITL filled ${data.hitl_session.filled_fields.length} non-sensitive fields (sensitive fields stay locked).`
+            : `Playwright fallback active: ${data.hitl_session.fallback_reason}`
+        );
+      } catch (err) {
+        if (hitlStatusBox) hitlStatusBox.textContent = err.message;
+        showNotice(`HITL autofill failed: ${err.message}`);
+      } finally {
+        hitlAutofillBtn.disabled = false;
+      }
+    });
+  }
+
+  if (batchQueueBtn) {
+    batchQueueBtn.addEventListener('click', async () => {
+      const mode = batchModeEl ? batchModeEl.value : 'heuristic';
+      if (readinessStatusEl) {
+        readinessStatusEl.textContent = `Running 10-role D1–D5 batch preparation (${mode})...`;
+      }
+      batchQueueBtn.disabled = true;
+      try {
+        const data = await postJson('/api/pipeline/queue-batch', {
+          limit: 10,
+          mode,
+          include_fictional: true,
+        });
+        if (data.readiness) {
+          renderReadinessData(data.readiness);
+        }
+        showNotice(`Prepared ${data.prepared_count} role(s) (${data.skipped_count} protected, ${data.error_count} errors).`);
+        if (typeof reload === 'function') await reload();
+        await renderPreflightBoard();
+        await renderReceiptLedger();
+        await syncTailorWorkspaceForSelectedJob();
+      } catch (err) {
+        if (readinessStatusEl) readinessStatusEl.textContent = `Batch queue error: ${err.message}`;
+        showNotice(`Batch prepare failed: ${err.message}`);
+      } finally {
+        batchQueueBtn.disabled = false;
+      }
+    });
+  }
+
+  if (refreshReadinessBtn) {
+    refreshReadinessBtn.addEventListener('click', async () => {
+      refreshReadinessBtn.disabled = true;
+      try {
+        await renderReadinessScorecard();
+        showNotice('Refreshed A-07 10-Job Readiness Scorecard.');
+      } finally {
+        refreshReadinessBtn.disabled = false;
+      }
+    });
+  }
+
   const prepareBtn = document.getElementById('prepare');
   if (prepareBtn) {
     prepareBtn.addEventListener('click', () => {
       setTimeout(() => {
         renderReceiptLedger();
         syncTailorWorkspaceForSelectedJob();
+        renderReadinessScorecard();
       }, 500);
     });
   }
@@ -1398,4 +1620,5 @@
   renderPreflightBoard();
   renderReceiptLedger();
   syncTailorWorkspaceForSelectedJob();
+  renderReadinessScorecard();
 })();

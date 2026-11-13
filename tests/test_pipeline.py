@@ -1929,5 +1929,254 @@ class GapBridgeAndCallbackTests(unittest.TestCase):
         self.assertEqual(code_demo_409, 409)
 
 
+from app.adapters_pipeline import PlaywrightHITLHelper
+
+
+class PlaywrightHITLAndPipelineReadinessTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._db_path = Path(self._tmp.name) / 'test_hitl_readiness.sqlite3'
+        self._patch = mock.patch.object(db, 'DB_PATH', self._db_path)
+        self._dns_patch = mock.patch('socket.getaddrinfo', side_effect=_fake_public_getaddrinfo)
+        self._patch.start()
+        self._dns_patch.start()
+        db.init_db()
+        self.sample_resume = (
+            'Jordan Taylor\n'
+            'Seattle, WA | jordan.taylor@example.org | (512) 555-0199\n'
+            'https://linkedin.com/in/jordantaylor | https://github.com/jordantaylor\n'
+            'Skills: Python, SQL, REST APIs, Docker, Automated Testing\n'
+            'Experience:\n'
+            '- Software Engineer, Northwind Systems (2023-2026): Built Python web services and SQL ETL pipelines, '
+            'reducing nightly batch latency by 20% across 12 production tables.\n'
+        )
+        self.real_job = {
+            'id': 101,
+            'title': 'Platform Engineer',
+            'company': 'Acme Cloud',
+            'location': 'Remote',
+            'description': 'Build reliable Python APIs, SQL ETL pipelines, and Docker workflows.',
+            'url': 'https://boards.greenhouse.io/acmecloud/jobs/4411',
+            'origin': 'imported_url',
+            'ats_family': 'greenhouse',
+        }
+
+    def tearDown(self):
+        self._dns_patch.stop()
+        self._patch.stop()
+        self._tmp.cleanup()
+
+    def test_playwright_hitl_consent_fictional_guard_fallback_and_mocked_headed_run(self):
+        caps = CoPilotApplicationAdapter.inspect_capabilities(config={'enable_playwright_hitl': False}, environ={})
+        self.assertIn('greenhouse', caps['hitl_supported_portals'])
+        self.assertFalse(caps['playwright_hitl_enabled'])
+
+        adapter_off = CoPilotApplicationAdapter(config={'enable_playwright_hitl': False})
+        base_payload = {
+            'job': self.real_job,
+            'approved_resume': self.sample_resume,
+            'candidate_answers': {
+                'full_name': 'Jordan Taylor',
+                'why_company_and_role': 'Strong match on Python and SQL ETL pipelines.',
+                # Even if a caller slips a sensitive key into candidate_answers, it must NEVER enter HITL field_plan
+                'salary_expectation': '$999k',
+                'work_authorization': 'Secret',
+            },
+        }
+
+        with self.assertRaises(PermissionError):
+            adapter_off.launch_hitl_autofill(base_payload, explicit_user_approval=False, environ={})
+
+        with self.assertRaises(ApplicationError):
+            adapter_off.launch_hitl_autofill(
+                {**base_payload, 'job': {'origin': 'fictional-sample', 'url': 'https://example.com/jobs/1'}},
+                explicit_user_approval=True,
+                environ={},
+            )
+
+        # Config disabled -> graceful D3 Co-Pilot fallback
+        fb = adapter_off.launch_hitl_autofill(base_payload, explicit_user_approval=True, environ={})
+        self.assertEqual(fb['mode'], 'copilot_fallback')
+        self.assertFalse(fb['executed'])
+        self.assertFalse(fb['submitted'])
+        self.assertEqual(fb['locked_sensitive_fields'], list(SENSITIVE_FIELDS))
+        self.assertTrue(any(f['field_key'] == 'email' for f in fb['non_sensitive_field_plan']))
+        for item in fb['non_sensitive_field_plan']:
+            self.assertNotIn(item['field_key'], SENSITIVE_FIELDS)
+        self.assertIn('ordered_sections', fb['copilot_packet'])
+
+        # Enabled + mocked headed Playwright runner
+        adapter_on = CoPilotApplicationAdapter(config={'enable_playwright_hitl': True})
+        captured: dict = {}
+
+        def fake_runner(*, url, field_plan, locked_sensitive_fields, timeout_ms):
+            captured['url'] = url
+            captured['field_plan'] = field_plan
+            captured['locked'] = locked_sensitive_fields
+            return {
+                'page_title': 'Acme Cloud — Platform Engineer',
+                'filled_fields': [f['field_key'] for f in field_plan],
+                'skipped_fields': [],
+                'submitted': False,
+            }
+
+        res_ok = adapter_on.launch_hitl_autofill(base_payload, explicit_user_approval=True, runner=fake_runner, environ={})
+        self.assertEqual(res_ok['mode'], 'playwright_hitl')
+        self.assertTrue(res_ok['executed'])
+        self.assertFalse(res_ok['submitted'])
+        self.assertEqual(captured['locked'], list(SENSITIVE_FIELDS))
+        sent_keys = {f['field_key'] for f in captured['field_plan']}
+        self.assertTrue({'first_name', 'last_name', 'email', 'phone'}.issubset(sent_keys))
+        self.assertTrue(sent_keys.isdisjoint(set(SENSITIVE_FIELDS)))
+
+        # Browser launch failure degrades cleanly to D3 Co-Pilot fallback instead of crashing
+        def broken_runner(**_kwargs):
+            raise RuntimeError('Chromium executable missing on Computer B')
+
+        res_broken = adapter_on.launch_hitl_autofill(base_payload, explicit_user_approval=True, runner=broken_runner, environ={})
+        self.assertEqual(res_broken['mode'], 'copilot_fallback')
+        self.assertFalse(res_broken['executed'])
+        self.assertFalse(res_broken['submitted'])
+        self.assertIn('Headed browser launch unavailable', res_broken['fallback_reason'])
+
+    def test_hitl_autofill_route_consent_immutability_and_audit_log(self):
+        with db.connection() as con:
+            con.execute('UPDATE profile SET resume=? WHERE id=1', (self.sample_resume,))
+            job_id = con.execute(
+                'INSERT INTO jobs(title, company, location, description, url, origin, ats_family) VALUES(?,?,?,?,?,?,?)',
+                (
+                    self.real_job['title'],
+                    self.real_job['company'],
+                    self.real_job['location'],
+                    self.real_job['description'],
+                    self.real_job['url'],
+                    'imported_url',
+                    'greenhouse',
+                ),
+            ).lastrowid
+
+        code_prep, body_prep = routes_pipeline.handle_post(
+            '/api/pipeline/prepare-ai',
+            {'job_id': job_id, 'mode': 'heuristic'},
+        )
+        self.assertEqual(code_prep, 200)
+        app_id = body_prep['application']['id']
+
+        code_403, _ = routes_pipeline.handle_post(
+            f'/api/pipeline/applications/{app_id}/hitl-autofill',
+            {'explicit_user_approval': False},
+        )
+        self.assertEqual(code_403, 403)
+
+        with mock.patch.object(PlaywrightHITLHelper, 'is_enabled', return_value=False):
+            code_ok, body_ok = routes_pipeline.handle_post(
+                f'/api/pipeline/applications/{app_id}/hitl-autofill',
+                {'explicit_user_approval': True, 'candidate_answers': {'location': 'Seattle, WA'}},
+            )
+        self.assertEqual(code_ok, 200)
+        self.assertEqual(body_ok['hitl_session']['mode'], 'copilot_fallback')
+        self.assertFalse(body_ok['hitl_session']['submitted'])
+        self.assertEqual(body_ok['application']['answers_data']['last_hitl_session']['mode'], 'copilot_fallback')
+
+        audits = db.rows("SELECT details_json FROM audit_events WHERE action='hitl_autofill_staged'")
+        self.assertEqual(len(audits), 1)
+        self.assertIn('"submitted": false', audits[0]['details_json'].lower())
+
+        # Confirm immutability & test_submitted isolation
+        with db.connection() as con:
+            con.execute("UPDATE applications SET status='confirmed' WHERE id=?", (app_id,))
+            demo_job_id = con.execute(
+                'INSERT INTO jobs(title, company, location, description, url, origin, ats_family) VALUES(?,?,?,?,?,?,?)',
+                ('Demo Job', 'Example Co', 'Remote', 'Python SQL', 'https://example.com/j/9', 'fictional-sample', 'unknown'),
+            ).lastrowid
+            demo_app_id = con.execute(
+                "INSERT INTO applications(job_id, tailored_resume, fit_score, status, confirmation) VALUES(?,?,?,'test_submitted',?)",
+                (demo_job_id, self.sample_resume, 70, 'DEMO ONLY'),
+            ).lastrowid
+
+        self.assertEqual(
+            routes_pipeline.handle_post(f'/api/pipeline/applications/{app_id}/hitl-autofill', {'explicit_user_approval': True})[0],
+            409,
+        )
+        self.assertEqual(
+            routes_pipeline.handle_post(f'/api/pipeline/applications/{demo_app_id}/hitl-autofill', {'explicit_user_approval': True})[0],
+            409,
+        )
+
+    def test_queue_batch_10_jobs_and_readiness_scorecard_acceptance_test_7(self):
+        code_st, body_st = routes_pipeline.handle_get('/api/pipeline/status')
+        self.assertEqual(code_st, 200)
+        self.assertIn('A-06', body_st['tasks_completed'])
+        self.assertIn('A-07', body_st['tasks_completed'])
+
+        # Clear default seeded jobs so we test clean 10-job pipeline from exact known count
+        with db.connection() as con:
+            con.execute('DELETE FROM applications')
+            con.execute('DELETE FROM gap_artifacts')
+            con.execute('DELETE FROM jobs')
+            con.execute('UPDATE profile SET resume=? WHERE id=1', (self.sample_resume,))
+            real_job_ids: list[int] = []
+            for idx in range(1, 11):
+                jid = con.execute(
+                    'INSERT INTO jobs(title, company, location, description, url, origin, ats_family) VALUES(?,?,?,?,?,?,?)',
+                    (
+                        f'Backend Engineer #{idx}',
+                        f'CloudCorp{idx}',
+                        'Remote',
+                        f'Build Python APIs, SQL ETL jobs, Docker harnesses, and Kubernetes role {idx}.',
+                        f'https://boards.greenhouse.io/cloudcorp{idx}/jobs/{1000 + idx}',
+                        'imported_url',
+                        'greenhouse',
+                    ),
+                ).lastrowid
+                real_job_ids.append(int(jid))
+
+        code_batch, body_batch = routes_pipeline.handle_post(
+            '/api/pipeline/queue-batch',
+            {'limit': 10, 'mode': 'heuristic'},
+        )
+        self.assertEqual(code_batch, 200)
+        self.assertEqual(body_batch['processed_count'], 10)
+        self.assertEqual(body_batch['prepared_count'], 10)
+        self.assertEqual(body_batch['error_count'], 0)
+
+        readiness = body_batch['readiness']
+        self.assertEqual(readiness['target_real_applications'], 10)
+        self.assertEqual(readiness['prepared_applications_count'], 10)
+        self.assertEqual(readiness['tailored_with_claim_map_count'], 10)
+        self.assertEqual(readiness['copilot_staged_count'], 10)
+        self.assertEqual(readiness['callback_ready_count'], 10)
+        self.assertTrue(readiness['ten_job_pipeline_ready'])
+        self.assertEqual(readiness['confirmed_real_submissions_count'], 0)
+        self.assertFalse(readiness['ten_real_submissions_reached'])
+
+        # Confirm 1 real submission with external receipt ID & check readiness increments honestly
+        first_app_id = body_batch['results'][0]['application_id']
+        code_conf, _ = routes_pipeline.handle_post(
+            f'/api/pipeline/applications/{first_app_id}/confirm',
+            {
+                'explicit_user_approval': True,
+                'sensitive_fields_confirmed': True,
+                'sensitive_answers': {
+                    'work_authorization': 'Authorized to work in the US without sponsorship',
+                    'visa_sponsorship': 'No',
+                    'salary_expectation': 'Negotiable ($140k-$165k)',
+                    'veteran_status': 'Decline to self-identify',
+                    'disability_status': 'Decline to self-identify',
+                    'references': 'Available upon request',
+                },
+                'outcome': 'confirmed',
+                'confirmation_reference': 'GH-BATCH-1001',
+            },
+        )
+        self.assertEqual(code_conf, 200)
+
+        code_r, body_r = routes_pipeline.handle_get('/api/pipeline/readiness')
+        self.assertEqual(code_r, 200)
+        self.assertEqual(body_r['confirmed_real_submissions_count'], 1)
+        self.assertEqual(body_r['demo_test_submissions_count'], 0)
+        self.assertEqual(body_r['prepared_applications_count'], 10)
+
+
 if __name__ == '__main__':
     unittest.main()

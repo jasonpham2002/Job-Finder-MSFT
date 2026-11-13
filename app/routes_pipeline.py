@@ -37,6 +37,8 @@ from .adapters_pipeline import (
     build_minimal_docx_bytes,
     compute_job_fit_snapshot,
     compute_sha256_text,
+    is_fictional_job,
+    load_pipeline_config,
     normalize_job_url,
 )
 
@@ -46,6 +48,7 @@ _JOB_GAPS_RE = re.compile(r'^/api/pipeline/jobs/(\d+)/gaps$')
 _GAP_VERIFY_RE = re.compile(r'^/api/pipeline/gaps/(\d+)/verify$')
 _APP_COPILOT_RE = re.compile(r'^/api/pipeline/applications/(\d+)/copilot$')
 _JOB_COPILOT_RE = re.compile(r'^/api/pipeline/jobs/(\d+)/copilot$')
+_APP_HITL_RE = re.compile(r'^/api/pipeline/applications/(\d+)/hitl-autofill$')
 _APP_CONFIRM_RE = re.compile(r'^/api/pipeline/applications/(\d+)/confirm$')
 _APP_EXPORT_DOCX_RE = re.compile(r'^/api/pipeline/applications/(\d+)/export-docx$')
 _APP_CALLBACK_RE = re.compile(r'^/api/pipeline/applications/(\d+)/callback-packet$')
@@ -56,9 +59,9 @@ def handle_get(path: str):
     if path == '/api/pipeline/status':
         return 200, {
             'owner': 'Owner A',
-            'scope': ['discovery', 'preflight_d1', 'resume_pdf_docx', 'tailor_d2', 'gaps_d5', 'copilot_d3'],
+            'scope': ['discovery', 'preflight_d1', 'resume_pdf_docx', 'tailor_d2', 'gaps_d5', 'copilot_d3', 'hitl_a06', 'readiness_a07'],
             'implemented': True,
-            'tasks_completed': ['A-01', 'A-02', 'A-03', 'A-04', 'A-05'],
+            'tasks_completed': ['A-01', 'A-02', 'A-03', 'A-04', 'A-05', 'A-06', 'A-07'],
             'model_adapter': UnifiedModelAdapter.inspect_capabilities(),
             'resume_adapter': {
                 **LocalResumeFileAdapter.inspect_capabilities(),
@@ -69,10 +72,13 @@ def handle_get(path: str):
             'tailor_adapter': VoicePreservingTailorAdapter.inspect_capabilities(),
             'gap_bridge_adapter': GapBridgeAdapter.inspect_capabilities(),
             'note': (
-                'Tasks A-01..A-05 complete (ModelAdapter, ResumeFileAdapter, JobDiscoveryAdapter + D1, '
-                'CoPilotApplicationAdapter + D3, VoicePreservingTailorAdapter + D2, GapBridgeAdapter + D5).'
+                'Tasks A-01..A-07 complete (ModelAdapter, ResumeFileAdapter, JobDiscoveryAdapter + D1, '
+                'CoPilotApplicationAdapter + D3 + HITL Playwright, VoicePreservingTailorAdapter + D2, '
+                'GapBridgeAdapter + D5, 10-Job Batch & Readiness Scorecard).'
             ),
         }
+    if path == '/api/pipeline/readiness':
+        return _handle_get_readiness()
     if path == '/api/pipeline/gaps':
         return _handle_list_all_gaps()
     job_gaps_match = _JOB_GAPS_RE.match(path)
@@ -839,6 +845,8 @@ def handle_post(path: str, payload: dict):
         return _handle_job_preflight(int(preflight_match.group(1)))
     if path == '/api/pipeline/prepare-ai':
         return _handle_prepare_ai(payload)
+    if path == '/api/pipeline/queue-batch':
+        return _handle_queue_batch(payload)
     if path == '/api/pipeline/tailor/lint':
         return _handle_tailor_lint(payload)
     if path == '/api/pipeline/gaps/analyze':
@@ -858,6 +866,9 @@ def handle_post(path: str, payload: dict):
     job_copilot_match = _JOB_COPILOT_RE.match(path)
     if job_copilot_match:
         return _handle_job_copilot(int(job_copilot_match.group(1)), payload)
+    hitl_match = _APP_HITL_RE.match(path)
+    if hitl_match:
+        return _handle_application_hitl_autofill(int(hitl_match.group(1)), payload)
     confirm_match = _APP_CONFIRM_RE.match(path)
     if confirm_match:
         return _handle_application_confirm(int(confirm_match.group(1)), payload)
@@ -1647,4 +1658,349 @@ def _handle_post_callback_packet(app_id: int, payload: dict[str, Any]) -> tuple[
         'application_id': app_id,
         'callback_packet': cb_packet,
         'application': _deserialize_application_row(refreshed),
+    }
+
+
+def _compute_pipeline_readiness() -> dict[str, Any]:
+    cfg = load_pipeline_config()
+    try:
+        target_real = max(1, int(cfg.get('target_real_applications') or 10))
+    except (TypeError, ValueError):
+        target_real = 10
+
+    job_rows = db.rows('SELECT id, title, company, url, origin, ats_family, preflight_json FROM jobs ORDER BY id DESC')
+    app_rows = db.rows(
+        'SELECT a.*, j.title, j.company, j.url, j.origin, j.ats_family '
+        'FROM applications a JOIN jobs j ON j.id=a.job_id ORDER BY a.id DESC'
+    )
+    gap_rows = db.rows('SELECT id, job_id, verified, gap_type FROM gap_artifacts')
+
+    real_jobs_count = 0
+    fictional_jobs_count = 0
+    preflight_evaluated_count = 0
+    for j in job_rows:
+        if is_fictional_job({'origin': j['origin'], 'url': j['url']}):
+            fictional_jobs_count += 1
+        else:
+            real_jobs_count += 1
+        if str(j['preflight_json'] or '').strip():
+            preflight_evaluated_count += 1
+
+    prepared_job_ids: set[int] = set()
+    tailored_count = 0
+    copilot_count = 0
+    callback_count = 0
+    confirmed_real_count = 0
+    demo_test_count = 0
+    manual_or_draft_count = 0
+    applications_audit: list[dict[str, Any]] = []
+
+    for row in app_rows:
+        jid = int(row['job_id'])
+        status = str(row['status'] or 'draft')
+        is_fict = is_fictional_job({'origin': row['origin'], 'url': row['url']})
+        has_tailored = len(str(row['tailored_resume'] or '').strip()) >= MIN_RESUME_CHARS
+        has_claim_map = bool(_safe_json_list(row['claim_map_json']))
+        has_ats_preview = bool(str(row['ats_preview_text'] or '').strip())
+        answers_store = _safe_json_dict(row['answers_json'])
+        has_copilot = bool(answers_store.get('copilot_packet'))
+        cb = _safe_json_dict(row['callback_packet_json'])
+        has_callback = bool(cb.get('why_this_role') and isinstance(cb.get('probe_questions'), list) and cb.get('probe_questions'))
+        has_sha256 = bool(str(row['resume_sha256'] or '').strip() and str(row['answers_sha256'] or '').strip())
+        conf_ref = str(row['confirmation'] or '').strip()
+        counts_real = bool(status == 'confirmed' and not is_fict and conf_ref and has_sha256)
+
+        if has_tailored and status != 'failed':
+            prepared_job_ids.add(jid)
+        if has_claim_map and has_ats_preview:
+            tailored_count += 1
+        if has_copilot:
+            copilot_count += 1
+        if has_callback:
+            callback_count += 1
+        if counts_real:
+            confirmed_real_count += 1
+        elif status == 'test_submitted':
+            demo_test_count += 1
+        else:
+            manual_or_draft_count += 1
+
+        applications_audit.append({
+            'application_id': int(row['id']),
+            'job_id': jid,
+            'title': row['title'] or '',
+            'company': row['company'] or '',
+            'ats_family': row['ats_family'] or engine.detect_ats_family(row['url'] or ''),
+            'status': status,
+            'is_fictional': is_fict,
+            'fit_score': int(row['fit_score'] or 0),
+            'has_tailored_resume': has_tailored,
+            'has_claim_map': has_claim_map,
+            'has_ats_preview': has_ats_preview,
+            'has_copilot_packet': has_copilot,
+            'has_callback_packet': has_callback,
+            'has_sha256_receipt': has_sha256,
+            'confirmation_reference': conf_ref if counts_real else None,
+            'counts_toward_real_10': counts_real,
+        })
+
+    gap_total = sum(1 for g in gap_rows if str(g['gap_type'] or '') != 'wording_gap')
+    gap_verified = sum(1 for g in gap_rows if str(g['gap_type'] or '') != 'wording_gap' and int(g['verified'] or 0) == 1)
+    prepared_distinct_count = len(prepared_job_ids)
+
+    return {
+        'target_real_applications': target_real,
+        'total_jobs': len(job_rows),
+        'real_public_jobs_count': real_jobs_count,
+        'fictional_jobs_count': fictional_jobs_count,
+        'preflight_evaluated_count': preflight_evaluated_count,
+        'prepared_applications_count': prepared_distinct_count,
+        'tailored_with_claim_map_count': tailored_count,
+        'copilot_staged_count': copilot_count,
+        'callback_ready_count': callback_count,
+        'confirmed_real_submissions_count': confirmed_real_count,
+        'demo_test_submissions_count': demo_test_count,
+        'manual_or_draft_count': manual_or_draft_count,
+        'gap_artifacts_total': gap_total,
+        'gap_artifacts_verified': gap_verified,
+        'ten_job_pipeline_ready': bool(prepared_distinct_count >= target_real),
+        'ten_real_submissions_reached': bool(confirmed_real_count >= target_real),
+        'applications_audit': applications_audit,
+    }
+
+
+def _handle_get_readiness() -> tuple[int, dict[str, Any]]:
+    readiness = _compute_pipeline_readiness()
+    return 200, {
+        'ok': True,
+        **readiness,
+        'application_adapter': CoPilotApplicationAdapter.inspect_capabilities(),
+    }
+
+
+def _handle_application_hitl_autofill(app_id: int, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return 400, {'error': 'Request body must be a JSON object.'}
+    app_row = db.row('SELECT * FROM applications WHERE id=?', (app_id,))
+    if not app_row:
+        return 404, {'error': f'Application {app_id} not found.'}
+    job_row = db.row('SELECT * FROM jobs WHERE id=?', (app_row['job_id'],))
+    if not job_row:
+        return 404, {'error': f'Job {app_row["job_id"]} not found.'}
+
+    if app_row['status'] == 'confirmed':
+        return 409, {'error': 'Confirmed application is immutable and cannot launch HITL autofill.'}
+    if app_row['status'] == 'test_submitted':
+        return 409, {'error': 'Demo test_submitted application stays isolated and cannot launch HITL autofill.'}
+
+    explicit_approval = bool(payload.get('explicit_user_approval', False))
+    if not explicit_approval:
+        return 403, {'error': 'Explicit candidate approval (explicit_user_approval=True) is required before HITL autofill.'}
+
+    existing_store = _safe_json_dict(app_row['answers_json'])
+    if not existing_store.get('copilot_packet') or payload.get('candidate_answers') or payload.get('approved_resume'):
+        stage_payload = {
+            k: payload[k]
+            for k in ('candidate_answers', 'approved_resume')
+            if k in payload
+        }
+        stage_code, stage_body = _build_and_save_copilot_packet(app_row, job_row, stage_payload)
+        if stage_code != 200:
+            return stage_code, stage_body
+        app_row = db.row('SELECT * FROM applications WHERE id=?', (app_id,))
+        existing_store = _safe_json_dict(app_row['answers_json'])
+
+    profile_row = db.row('SELECT resume FROM profile WHERE id=1')
+    profile_resume = (profile_row or {}).get('resume') or ''
+    approved_resume = str(payload.get('approved_resume') or app_row['tailored_resume'] or profile_resume).strip()
+    candidate_answers = _strip_sensitive_answers(_safe_json_dict(existing_store.get('candidate_answers')))
+    copilot_packet = existing_store.get('copilot_packet')
+
+    try:
+        hitl_session = _get_application_adapter().launch_hitl_autofill(
+            {
+                'job': dict(job_row),
+                'approved_resume': approved_resume,
+                'candidate_answers': candidate_answers,
+                'copilot_packet': copilot_packet,
+            },
+            explicit_user_approval=explicit_approval,
+        )
+    except PermissionError as exc:
+        return 403, {'error': str(exc)}
+    except ApplicationError as exc:
+        return 400, {'error': str(exc)}
+
+    updated_store = {
+        **existing_store,
+        'last_hitl_session': {
+            'mode': hitl_session.get('mode'),
+            'executed': bool(hitl_session.get('executed', False)),
+            'submitted': False,
+            'ats_family': hitl_session.get('ats_family'),
+            'filled_fields': list(hitl_session.get('filled_fields') or []),
+            'locked_sensitive_fields': list(hitl_session.get('locked_sensitive_fields') or SENSITIVE_FIELDS),
+            'fallback_reason': hitl_session.get('fallback_reason', ''),
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+        },
+    }
+    with db.connection() as con:
+        con.execute(
+            'UPDATE applications SET answers_json=? WHERE id=?',
+            (json.dumps(updated_store, ensure_ascii=False), app_id),
+        )
+
+    refreshed = db.row(
+        'SELECT a.*, j.title, j.company, j.url FROM applications a JOIN jobs j ON j.id=a.job_id WHERE a.id=?',
+        (app_id,),
+    )
+    db.log_audit(
+        'candidate',
+        'hitl_autofill_staged',
+        'application',
+        str(app_id),
+        {
+            'job_id': job_row['id'],
+            'mode': hitl_session.get('mode'),
+            'executed': bool(hitl_session.get('executed', False)),
+            'filled_field_count': len(hitl_session.get('filled_fields') or []),
+            'submitted': False,
+        },
+    )
+    return 200, {
+        'ok': True,
+        'application_id': app_id,
+        'hitl_session': hitl_session,
+        'copilot_packet': copilot_packet,
+        'application': _deserialize_application_row(refreshed),
+    }
+
+
+def _handle_queue_batch(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return 400, {'error': 'Request body must be a JSON object.'}
+
+    raw_limit = payload.get('limit', 10)
+    try:
+        limit = int(raw_limit)
+    except (TypeError, ValueError):
+        return 400, {'error': 'limit must be an integer.'}
+    limit = max(1, min(25, limit))
+
+    mode = str(payload.get('mode') or 'heuristic').strip().lower()
+    if mode not in ('heuristic', 'auto', 'llm'):
+        return 400, {'error': 'mode must be one of: heuristic, auto, llm.'}
+
+    include_fictional = bool(payload.get('include_fictional', True))
+    refresh_gaps = bool(payload.get('refresh_gaps', False))
+
+    profile_row = db.row('SELECT resume FROM profile WHERE id=1')
+    profile_resume = str(payload.get('base_resume') or ((profile_row or {}).get('resume')) or '').strip()
+    if len(profile_resume) < MIN_RESUME_CHARS:
+        return 400, {'error': f'Candidate resume must contain at least {MIN_RESUME_CHARS} characters before batch queuing.'}
+
+    all_jobs = db.rows('SELECT * FROM jobs ORDER BY id DESC')
+    ordered_jobs = sorted(
+        all_jobs,
+        key=lambda j: (1 if is_fictional_job({'origin': j['origin'], 'url': j['url']}) else 0, -int(j['id'])),
+    )
+    if not include_fictional:
+        ordered_jobs = [j for j in ordered_jobs if not is_fictional_job({'origin': j['origin'], 'url': j['url']})]
+    target_jobs = ordered_jobs[:limit]
+
+    results: list[dict[str, Any]] = []
+    prepared_count = 0
+    skipped_count = 0
+    error_count = 0
+
+    for job_row in target_jobs:
+        jid = int(job_row['id'])
+        evaluated_job = _evaluate_and_persist_job_preflight(job_row)
+        existing_app = db.row('SELECT id, status FROM applications WHERE job_id=?', (jid,))
+        if existing_app and existing_app['status'] in ('confirmed', 'test_submitted'):
+            skipped_count += 1
+            results.append({
+                'job_id': jid,
+                'title': evaluated_job.get('title', ''),
+                'company': evaluated_job.get('company', ''),
+                'application_id': int(existing_app['id']),
+                'status': existing_app['status'],
+                'action': 'skipped_protected',
+            })
+            continue
+
+        existing_gaps = db.row('SELECT COUNT(*) AS cnt FROM gap_artifacts WHERE job_id=?', (jid,))
+        if refresh_gaps or not existing_gaps or int(existing_gaps['cnt']) == 0:
+            gap_code, gap_body = _handle_gap_analyze({'job_id': jid, 'base_resume': profile_resume, 'mode': mode})
+            if gap_code != 200:
+                error_count += 1
+                results.append({
+                    'job_id': jid,
+                    'title': evaluated_job.get('title', ''),
+                    'company': evaluated_job.get('company', ''),
+                    'action': 'error_gaps',
+                    'error': gap_body.get('error', 'Gap analysis failed'),
+                })
+                continue
+
+        prep_code, prep_body = _handle_prepare_ai({'job_id': jid, 'base_resume': profile_resume, 'mode': mode})
+        if prep_code != 200:
+            error_count += 1
+            results.append({
+                'job_id': jid,
+                'title': evaluated_job.get('title', ''),
+                'company': evaluated_job.get('company', ''),
+                'action': 'error_prepare',
+                'error': prep_body.get('error', 'Prepare AI failed'),
+            })
+            continue
+
+        app_id = int(prep_body['application']['id'])
+        cp_code, cp_body = _handle_application_copilot(app_id, {})
+        if cp_code != 200:
+            error_count += 1
+            results.append({
+                'job_id': jid,
+                'title': evaluated_job.get('title', ''),
+                'company': evaluated_job.get('company', ''),
+                'application_id': app_id,
+                'action': 'error_copilot',
+                'error': cp_body.get('error', 'Co-Pilot staging failed'),
+            })
+            continue
+
+        prepared_count += 1
+        results.append({
+            'job_id': jid,
+            'title': evaluated_job.get('title', ''),
+            'company': evaluated_job.get('company', ''),
+            'ats_family': evaluated_job.get('ats_family', 'unknown'),
+            'application_id': app_id,
+            'status': cp_body['application']['status'],
+            'fit_score': cp_body['application']['fit_score'],
+            'action': 'prepared',
+        })
+
+    readiness = _compute_pipeline_readiness()
+    db.log_audit(
+        'pipeline',
+        'queue_batch_prepared',
+        'application',
+        '',
+        {
+            'limit': limit,
+            'mode': mode,
+            'prepared_count': prepared_count,
+            'skipped_count': skipped_count,
+            'error_count': error_count,
+        },
+    )
+    return 200, {
+        'ok': True,
+        'processed_count': len(target_jobs),
+        'prepared_count': prepared_count,
+        'skipped_count': skipped_count,
+        'error_count': error_count,
+        'results': results,
+        'readiness': readiness,
     }

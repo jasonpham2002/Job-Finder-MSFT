@@ -5,6 +5,8 @@ defined in app/adapters.py without embedding secrets or writing candidate resume
 """
 from __future__ import annotations
 
+import importlib
+import importlib.util
 import io
 import json
 import os
@@ -1561,6 +1563,187 @@ def _extract_experience_lines(resume_text: str, limit: int = 8) -> str:
     return '\n'.join(chosen)[:2000]
 
 
+_ATS_NON_SENSITIVE_SELECTORS: dict[str, dict[str, tuple[str, ...]]] = {
+    'greenhouse': {
+        'first_name': ('input#first_name', 'input[name="job_application[first_name]"]'),
+        'last_name': ('input#last_name', 'input[name="job_application[last_name]"]'),
+        'full_name': ('input[name="name"]', 'input[autocomplete="name"]'),
+        'email': ('input#email', 'input[name="job_application[email]"]', 'input[type="email"]'),
+        'phone': ('input#phone', 'input[name="job_application[phone]"]', 'input[type="tel"]'),
+        'location': ('input#job_application_location', 'input[name*="location" i]'),
+        'linkedin_url': ('input[aria-label*="LinkedIn" i]', 'input[name*="linkedin" i]'),
+        'github_url': ('input[aria-label*="GitHub" i]', 'input[name*="github" i]'),
+    },
+    'lever': {
+        'full_name': ('input[name="name"]', 'input[placeholder*="Full name" i]'),
+        'email': ('input[name="email"]', 'input[type="email"]'),
+        'phone': ('input[name="phone"]', 'input[type="tel"]'),
+        'location': ('input[name="location"]', 'input[name*="location" i]'),
+        'linkedin_url': ('input[name="urls[LinkedIn]"]', 'input[name*="linkedin" i]'),
+        'github_url': ('input[name="urls[GitHub]"]', 'input[name*="github" i]'),
+        'why_company_and_role': ('textarea[name="comments"]', 'textarea[name*="additional" i]'),
+    },
+    'ashby': {
+        'full_name': ('input[name="_systemfield_name"]', 'input[autocomplete="name"]'),
+        'first_name': ('input[name*="first" i]',),
+        'last_name': ('input[name*="last" i]',),
+        'email': ('input[name="_systemfield_email"]', 'input[type="email"]'),
+        'phone': ('input[name="_systemfield_phone"]', 'input[type="tel"]'),
+        'linkedin_url': ('input[name*="linkedin" i]',),
+        'github_url': ('input[name*="github" i]',),
+    },
+    'workday': {
+        'first_name': ('input[data-automation-id="legalNameSection_firstName"]', 'input[name*="firstName" i]'),
+        'last_name': ('input[data-automation-id="legalNameSection_lastName"]', 'input[name*="lastName" i]'),
+        'email': ('input[data-automation-id="email"]', 'input[type="email"]'),
+        'phone': ('input[data-automation-id="phone-number"]', 'input[type="tel"]'),
+        'location': ('input[data-automation-id="addressSection_city"]',),
+        'linkedin_url': ('input[data-automation-id*="linkedin" i]',),
+    },
+    'company_site': {
+        'full_name': ('input[autocomplete="name"]', 'input[name*="name" i]'),
+        'first_name': ('input[autocomplete="given-name"]', 'input[name*="first" i]'),
+        'last_name': ('input[autocomplete="family-name"]', 'input[name*="last" i]'),
+        'email': ('input[type="email"]', 'input[name*="email" i]'),
+        'phone': ('input[type="tel"]', 'input[name*="phone" i]'),
+        'location': ('input[name*="location" i]', 'input[autocomplete="address-level2"]'),
+        'linkedin_url': ('input[name*="linkedin" i]',),
+        'github_url': ('input[name*="github" i]',),
+    },
+    'unknown': {
+        'full_name': ('input[autocomplete="name"]',),
+        'first_name': ('input[autocomplete="given-name"]',),
+        'last_name': ('input[autocomplete="family-name"]',),
+        'email': ('input[type="email"]',),
+        'phone': ('input[type="tel"]',),
+    },
+}
+
+
+class PlaywrightHITLHelper:
+    """Task A-06 optional headed Playwright autofill helper with strict non-sensitive field limits."""
+
+    @staticmethod
+    def is_playwright_installed() -> bool:
+        return importlib.util.find_spec('playwright') is not None
+
+    @staticmethod
+    def is_enabled(
+        config: Optional[Mapping[str, Any]] = None,
+        environ: Optional[Mapping[str, str]] = None,
+    ) -> bool:
+        env = dict(os.environ if environ is None else environ)
+        for key in ('PLAYWRIGHT_HITL_ENABLED', 'ENABLE_PLAYWRIGHT_HITL'):
+            if key in env and str(env[key]).strip():
+                val = str(env[key]).strip().lower()
+                if val in ('1', 'true', 'yes', 'on'):
+                    return True
+                if val in ('0', 'false', 'no', 'off'):
+                    return False
+        cfg = dict(config) if config is not None else load_pipeline_config()
+        return bool(cfg.get('enable_playwright_hitl', False))
+
+    @staticmethod
+    def build_non_sensitive_field_plan(
+        job: Mapping[str, Any],
+        approved_resume: str,
+        candidate_answers: Optional[Mapping[str, Any]] = None,
+        ats_family: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        url = str(job.get('url') or '').strip()
+        portal = str(ats_family or job.get('ats_family') or engine.detect_ats_family(url) or 'unknown').strip().lower()
+        selectors = _ATS_NON_SENSITIVE_SELECTORS.get(portal, _ATS_NON_SENSITIVE_SELECTORS['unknown'])
+        hints = extract_contact_hints(approved_resume)
+        answers = {
+            k: str(v).strip()
+            for k, v in (candidate_answers or {}).items()
+            if k not in SENSITIVE_FIELDS and str(v or '').strip()
+        }
+
+        full_name = answers.get('full_name') or hints.get('full_name') or ''
+        name_parts = [p for p in full_name.split() if p]
+        derived = {
+            'full_name': full_name,
+            'first_name': answers.get('first_name') or (name_parts[0] if name_parts else ''),
+            'last_name': answers.get('last_name') or (name_parts[-1] if len(name_parts) >= 2 else ''),
+            'email': answers.get('email') or hints.get('email') or '',
+            'phone': answers.get('phone') or hints.get('phone') or '',
+            'location': answers.get('location') or '',
+            'linkedin_url': answers.get('linkedin_url') or hints.get('linkedin_url') or '',
+            'github_url': answers.get('github_url') or hints.get('github_url') or '',
+            'why_company_and_role': answers.get('why_company_and_role') or '',
+            'additional_answers': answers.get('additional_answers') or '',
+        }
+
+        plan: list[dict[str, Any]] = []
+        for field_key, sel_list in selectors.items():
+            if field_key in SENSITIVE_FIELDS:
+                continue
+            val = derived.get(field_key, '').strip()
+            if not val:
+                continue
+            plan.append({
+                'field_key': field_key,
+                'value': val,
+                'selectors': list(sel_list),
+                'sensitive': False,
+            })
+        return plan
+
+    @staticmethod
+    def run_headed_autofill(
+        url: str,
+        field_plan: Sequence[Mapping[str, Any]],
+        runner: Optional[Callable[..., dict[str, Any]]] = None,
+        timeout_ms: int = 20000,
+    ) -> dict[str, Any]:
+        """Open a visible browser on a verified public URL and fill ONLY non-sensitive fields (never submits)."""
+        clean_url = engine.valid_public_url(str(url or '').strip())
+        safe_plan = [dict(item) for item in field_plan if item.get('field_key') not in SENSITIVE_FIELDS]
+
+        if runner is not None:
+            return runner(
+                url=clean_url,
+                field_plan=safe_plan,
+                locked_sensitive_fields=list(SENSITIVE_FIELDS),
+                timeout_ms=timeout_ms,
+            )
+
+        pw_sync = importlib.import_module('playwright.sync_api')
+        filled_fields: list[str] = []
+        skipped_fields: list[str] = []
+        with pw_sync.sync_playwright() as p:
+            browser = p.chromium.launch(headless=False)
+            try:
+                context = browser.new_context()
+                page = context.new_page()
+                page.goto(clean_url, wait_until='domcontentloaded', timeout=timeout_ms)
+                page_title = page.title()
+                for entry in safe_plan:
+                    fkey = str(entry.get('field_key') or '')
+                    fval = str(entry.get('value') or '')
+                    matched = False
+                    for sel in entry.get('selectors') or ():
+                        loc = page.locator(sel).first
+                        if loc.count() > 0 and loc.is_visible():
+                            current = loc.input_value() if hasattr(loc, 'input_value') else ''
+                            if not str(current or '').strip():
+                                loc.fill(fval)
+                            filled_fields.append(fkey)
+                            matched = True
+                            break
+                    if not matched:
+                        skipped_fields.append(fkey)
+                return {
+                    'page_title': page_title,
+                    'filled_fields': filled_fields,
+                    'skipped_fields': skipped_fields,
+                    'submitted': False,
+                }
+            finally:
+                browser.close()
+
+
 class CoPilotApplicationAdapter(ApplicationAdapter):
     """D3 Human-Assist Co-Pilot Packet builder, Sensitive-Field Gate, and SHA-256 Receipt recorder."""
 
@@ -1568,14 +1751,146 @@ class CoPilotApplicationAdapter(ApplicationAdapter):
         self._config = dict(config) if config is not None else load_pipeline_config()
 
     @classmethod
-    def inspect_capabilities(cls, config: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    def inspect_capabilities(
+        cls,
+        config: Optional[dict[str, Any]] = None,
+        environ: Optional[Mapping[str, str]] = None,
+    ) -> dict[str, Any]:
         """Report Co-Pilot adapter capabilities cleanly."""
         cfg = dict(config) if config is not None else load_pipeline_config()
         return {
             'supported_portals': sorted(set(_PORTAL_SECTION_FLOWS.keys()) | {'linkedin', 'indeed', 'company_site', 'unknown'}),
             'sensitive_fields_locked': list(SENSITIVE_FIELDS),
             'requires_explicit_approval': True,
-            'playwright_hitl_enabled': bool(cfg.get('enable_playwright_hitl', False)),
+            'playwright_hitl_enabled': PlaywrightHITLHelper.is_enabled(cfg, environ=environ),
+            'playwright_available': PlaywrightHITLHelper.is_playwright_installed(),
+            'hitl_supported_portals': sorted(_ATS_NON_SENSITIVE_SELECTORS.keys()),
+        }
+
+    def launch_hitl_autofill(
+        self,
+        prepared_application: Mapping[str, Any],
+        explicit_user_approval: bool,
+        runner: Optional[Callable[..., dict[str, Any]]] = None,
+        environ: Optional[Mapping[str, str]] = None,
+    ) -> dict[str, Any]:
+        """Fill ONLY non-sensitive portal fields in a headed browser, degrading cleanly to D3 Co-Pilot."""
+        if not explicit_user_approval:
+            raise PermissionError('Cannot launch HITL autofill without candidate approval (explicit_user_approval=True).')
+        if not isinstance(prepared_application, Mapping):
+            raise ApplicationError('prepared_application must be a dict.')
+
+        job = prepared_application.get('job') if isinstance(prepared_application.get('job'), Mapping) else {}
+        approved_resume = str(
+            prepared_application.get('approved_resume')
+            or prepared_application.get('tailored_resume')
+            or ''
+        ).strip()
+        if len(approved_resume) < 50:
+            raise ApplicationError('Approved resume must contain at least 50 characters before HITL autofill.')
+
+        if is_fictional_job(job):
+            raise ApplicationError(
+                'Fictional demo jobs cannot launch live browser autofill; use D3 Co-Pilot preview instead.'
+            )
+
+        url = str(job.get('url') or '').strip()
+        try:
+            clean_url = engine.valid_public_url(url)
+        except ValueError as exc:
+            raise ApplicationError(str(exc)) from exc
+
+        ats_family = str(job.get('ats_family') or engine.detect_ats_family(clean_url) or 'unknown').strip().lower()
+        candidate_answers = prepared_application.get('candidate_answers')
+        clean_answers = dict(candidate_answers) if isinstance(candidate_answers, Mapping) else {}
+        field_plan = PlaywrightHITLHelper.build_non_sensitive_field_plan(
+            job,
+            approved_resume,
+            candidate_answers=clean_answers,
+            ats_family=ats_family,
+        )
+
+        packet = prepared_application.get('copilot_packet')
+        if not packet:
+            built = self.prepare(
+                dict(job),
+                {'resume': approved_resume, 'candidate_answers': clean_answers},
+                approved_resume,
+            )
+            packet = {
+                'job_id': built.job_id,
+                'ats_family': built.ats_family,
+                'ordered_sections': built.ordered_sections,
+                'sensitive_fields_locked': built.sensitive_fields_locked,
+                'callback_packet': built.callback_packet,
+            }
+
+        manual_steps = [
+            'Sign in manually and complete any login / MFA / CAPTCHA challenge yourself.',
+            'Upload your verified tailored resume file and verify every pre-filled field.',
+            f'Manually enter locked sensitive fields ({", ".join(SENSITIVE_FIELDS)}) and click Submit yourself.',
+        ]
+
+        enabled = PlaywrightHITLHelper.is_enabled(self._config, environ=environ)
+        installed = PlaywrightHITLHelper.is_playwright_installed() or (runner is not None)
+        if not enabled or not installed:
+            reason = (
+                'Playwright HITL is disabled in config (enable_playwright_hitl=false); using D3 Co-Pilot fallback.'
+                if not enabled
+                else 'Playwright is not installed in this environment; using D3 Co-Pilot fallback.'
+            )
+            return {
+                'mode': 'copilot_fallback',
+                'executed': False,
+                'submitted': False,
+                'ats_family': ats_family,
+                'target_url': clean_url,
+                'playwright_enabled': enabled,
+                'playwright_installed': PlaywrightHITLHelper.is_playwright_installed(),
+                'fallback_reason': reason,
+                'non_sensitive_field_plan': field_plan,
+                'filled_fields': [],
+                'skipped_fields': [item['field_key'] for item in field_plan],
+                'locked_sensitive_fields': list(SENSITIVE_FIELDS),
+                'manual_steps_remaining': manual_steps,
+                'copilot_packet': packet,
+            }
+
+        try:
+            run_out = PlaywrightHITLHelper.run_headed_autofill(clean_url, field_plan, runner=runner)
+        except Exception as exc:
+            return {
+                'mode': 'copilot_fallback',
+                'executed': False,
+                'submitted': False,
+                'ats_family': ats_family,
+                'target_url': clean_url,
+                'playwright_enabled': enabled,
+                'playwright_installed': PlaywrightHITLHelper.is_playwright_installed(),
+                'fallback_reason': f'Headed browser launch unavailable ({type(exc).__name__}); using D3 Co-Pilot fallback.',
+                'non_sensitive_field_plan': field_plan,
+                'filled_fields': [],
+                'skipped_fields': [item['field_key'] for item in field_plan],
+                'locked_sensitive_fields': list(SENSITIVE_FIELDS),
+                'manual_steps_remaining': manual_steps,
+                'copilot_packet': packet,
+            }
+
+        return {
+            'mode': 'playwright_hitl',
+            'executed': True,
+            'submitted': False,
+            'ats_family': ats_family,
+            'target_url': clean_url,
+            'playwright_enabled': True,
+            'playwright_installed': True,
+            'page_title': str(run_out.get('page_title') or ''),
+            'non_sensitive_field_plan': field_plan,
+            'filled_fields': list(run_out.get('filled_fields') or []),
+            'skipped_fields': list(run_out.get('skipped_fields') or []),
+            'locked_sensitive_fields': list(SENSITIVE_FIELDS),
+            'manual_steps_remaining': manual_steps,
+            'copilot_packet': packet,
         }
 
     def prepare(

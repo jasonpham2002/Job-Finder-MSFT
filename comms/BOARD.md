@@ -20,9 +20,9 @@
 ## Active File Locks & Blockers
 | File / Scope | Locked By | Task ID | Since | Notes |
 |---|---|---|---|---|
-| _None_ | — | — | — | Owner A released locks after completing `A-05` (`H-03` posted). |
+| _None_ | — | — | — | Owner A queue (`A-01..A-07`) complete; all locks released (`H-04` posted). |
 
-**Current Blockers:** _None — Foundation (`S-01`), `A-01..A-05`, and handoffs `H-01..H-03` complete._
+**Current Blockers:** _None — Foundation (`S-01`), entire Owner A queue (`A-01..A-07`), and handoffs `H-01..H-04` complete._
 
 ---
 
@@ -41,8 +41,8 @@
 | `A-03` | **D3** Co-Pilot Packet + Sensitive-Field Gate + SHA-256 Receipts | `DONE` | `A-01` | `app/adapters_pipeline.py`, `app/routes_pipeline.py`, `web/pipeline.js`, `tests/test_pipeline.py` (39/39 tests passing) |
 | `A-04` | **D2** Voice-Preserving Anti-Slop Tailor + ATS Plain-Text Preview | `DONE` | `A-01` | `app/engine.py`, `app/adapters_pipeline.py`, `app/routes_pipeline.py`, `web/pipeline.js`, `tests/test_pipeline.py` (44/44 tests passing; live Gemini `gemini-3.8-flash` smoke test OK) |
 | `A-05` | **D5** Gap-to-Proof Bridge + **D2** Callback Cheat Sheet Snapshot | `DONE` | `A-04` | `app/engine.py`, `app/adapters_pipeline.py`, `app/routes_pipeline.py`, `web/pipeline.js`, `tests/test_pipeline.py` · See `comms/handoffs/H-03-gap-bridge-callback-packet.md` (48/48 tests passing; live Gemini `gemini-3.8-flash` smoke test OK) |
-| `A-06` | *(Optional)* Headed Playwright HITL Autofill | `TODO` | `A-03` | `app/adapters_pipeline.py` |
-| `A-07` | Unit tests (`tests/test_pipeline.py`) + Live Submissions | `TODO` | `A-03` | `tests/test_pipeline.py` |
+| `A-06` | *(Optional)* Headed Playwright HITL Autofill | `DONE` | `A-03` | `app/adapters_pipeline.py`, `app/routes_pipeline.py`, `web/pipeline.js`, `tests/test_pipeline.py` · Graceful D3 Co-Pilot fallback; sensitive fields strictly locked |
+| `A-07` | Unit tests (`tests/test_pipeline.py`) + Live Submissions Readiness | `DONE` | `A-03`, `A-05`, `A-06` | `app/routes_pipeline.py`, `web/pipeline.js`, `tests/test_pipeline.py` · See `comms/handoffs/H-04-owner-a-complete.md` (51/51 tests passing; 10-job batch + readiness scorecard ready for human live submissions) |
 
 ### Owner B Queue (`plans/OWNER_B_WORKBOOK.md`)
 | ID | Task | Status | Depends On | Target Files |
