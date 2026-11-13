@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Application",
+  "type": "object",
+  "required": [
+    "job_id",
+    "candidate_id",
+    "resume_version",
+    "status",
+    "approved"
+  ],
+  "properties": {
+    "job_id": {
+      "type": "string"
+    },
+    "candidate_id": {
+      "type": "string"
+    },
+    "resume_version": {
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "discovered",
+        "prepared",
+        "waiting_review",
+        "approved",
+        "submitting",
+        "confirmed",
+        "unknown",
+        "failed",
+        "manual_required",
+        "test_submitted"
+      ]
+    },
+    "approved": {
+      "type": "boolean"
+    },
+    "approved_at": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "submitted_at": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "confirmation_reference": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "notes": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false
+}

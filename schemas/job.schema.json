@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Job",
+  "type": "object",
+  "required": [
+    "id",
+    "title",
+    "company",
+    "description",
+    "url",
+    "source",
+    "extraction_status"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "title": {
+      "type": "string"
+    },
+    "company": {
+      "type": "string"
+    },
+    "description": {
+      "type": "string"
+    },
+    "url": {
+      "type": "string",
+      "format": "uri"
+    },
+    "source": {
+      "type": "string"
+    },
+    "location": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "salary_text": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "posted_at": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "extraction_status": {
+      "enum": [
+        "verified",
+        "needs_review",
+        "manual_fallback",
+        "unavailable"
+      ]
+    },
+    "last_checked_at": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "additionalProperties": false
+}

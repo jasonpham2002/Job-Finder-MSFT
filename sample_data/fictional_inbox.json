@@ -1,0 +1,5 @@
+[
+  {"from":"recruiting@example.com","subject":"Re: Solutions Engineer Application [FICTIONAL TEST]","body":"Thanks for reaching out. Please share your availability for a conversation next week.","classification":"human_positive_reply","note":"Synthetic test only; never count as a real hackathon bonus."},
+  {"from":"no-reply@example.com","subject":"Application received [FICTIONAL TEST]","body":"This is an automated confirmation that your application has been received.","classification":"automated_receipt","note":"Synthetic test only; not a recruiter response."},
+  {"from":"recruiting@example.com","subject":"Re: Support Role [FICTIONAL TEST]","body":"We are not moving forward at this time.","classification":"rejection","note":"Synthetic test only."}
+]

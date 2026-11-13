@@ -1,0 +1,3 @@
+# Offline starter uses Python 3.10+ STANDARD LIBRARY ONLY.
+# Students add and pin real integration dependencies here.
+# Examples may include PDF/DOCX readers, an AI SDK or approved API clients.

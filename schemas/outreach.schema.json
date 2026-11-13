@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Outreach",
+  "type": "object",
+  "required": [
+    "contact_name",
+    "job_id",
+    "channel",
+    "draft",
+    "status",
+    "approved"
+  ],
+  "properties": {
+    "contact_name": {
+      "type": "string"
+    },
+    "job_id": {
+      "type": "string"
+    },
+    "channel": {
+      "enum": [
+        "professional_email",
+        "linkedin_manual",
+        "other_authorized"
+      ]
+    },
+    "draft": {
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "draft",
+        "waiting_review",
+        "approved",
+        "sending",
+        "sent",
+        "unknown",
+        "failed",
+        "opted_out"
+      ]
+    },
+    "approved": {
+      "type": "boolean"
+    },
+    "sent_at": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "message_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "additionalProperties": false
+}

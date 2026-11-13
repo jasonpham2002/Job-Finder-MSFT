@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ProfessionalContact",
+  "type": "object",
+  "required": [
+    "name",
+    "title",
+    "company",
+    "source_url",
+    "verification_status"
+  ],
+  "properties": {
+    "name": {
+      "type": "string"
+    },
+    "title": {
+      "type": "string"
+    },
+    "company": {
+      "type": "string"
+    },
+    "source_url": {
+      "type": "string"
+    },
+    "linkedin_url": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "professional_email": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "verification_status": {
+      "enum": [
+        "verified_public",
+        "user_provided",
+        "unverified",
+        "fictional_test"
+      ]
+    },
+    "relevance_reason": {
+      "type": "string"
+    },
+    "opted_out": {
+      "type": "boolean"
+    }
+  },
+  "additionalProperties": false
+}

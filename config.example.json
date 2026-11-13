@@ -1,0 +1,19 @@
+{
+  "mode": "demo",
+  "ai_provider": "none",
+  "preferred_role_terms": ["Solutions Engineer", "Customer Success", "Sales Operations"],
+  "locations": ["Dallas, TX", "Remote USA"],
+  "minimum_salary_usd": null,
+  "work_arrangements": ["remote", "hybrid", "onsite"],
+  "target_real_applications": 10,
+  "target_approved_outreach": 10,
+  "require_application_review": true,
+  "require_outreach_review": true,
+  "max_contacts_per_company": 3,
+  "max_messages_per_contact": 1,
+  "enable_real_apply": false,
+  "enable_real_send": false,
+  "enabled_application_adapters": [],
+  "enabled_outreach_adapters": [],
+  "save_private_resume_to_export": false
+}

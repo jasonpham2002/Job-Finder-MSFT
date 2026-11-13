@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RecruiterResponse",
+  "type": "object",
+  "required": [
+    "message_id",
+    "classification",
+    "human_verified"
+  ],
+  "properties": {
+    "message_id": {
+      "type": "string"
+    },
+    "thread_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "classification": {
+      "enum": [
+        "human_positive_reply",
+        "automated_receipt",
+        "interview_invitation",
+        "referral_opportunity",
+        "rejection",
+        "request_for_info",
+        "unsubscribe",
+        "unknown"
+      ]
+    },
+    "human_verified": {
+      "type": "boolean"
+    },
+    "received_at": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "follow_up_draft": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "additionalProperties": false
+}

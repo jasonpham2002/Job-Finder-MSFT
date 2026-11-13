@@ -1,0 +1,5 @@
+Hackathon 4 Universal Job Finder Student Starter
+Version: 1.0.0
+Date: 2026-11-13
+Mode: offline demonstration and student implementation kit
+Status: Real auto-apply, external contact research, live sending and email sync are NOT implemented.
