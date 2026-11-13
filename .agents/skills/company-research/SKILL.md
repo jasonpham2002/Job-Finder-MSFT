@@ -27,3 +27,7 @@ If the needed website, email provider, AI model or file tool is not connected or
 
 ## Related resources
 See `../../prompts/system_prompt.md`, `../../docs/SECURITY_AND_CONSENT.md`, and `../../schemas/` in the full project distribution.
+
+## Differentiator workflow
+
+For D4, require an attributed public artifact with type, title, source URL and excerpt. Keep the source and rationale with each contact. Return manual search queries when no contact can be verified.

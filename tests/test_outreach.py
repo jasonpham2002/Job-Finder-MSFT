@@ -8,8 +8,11 @@ from unittest.mock import patch
 from urllib.parse import parse_qs
 
 from app import db
-from app.adapters_outreach import GmailOutreachAdapter, ManualOutreachAdapter, OutlookOutreachAdapter
-from app.routes_outreach import handle_post
+from app.adapters_outreach import (
+    GmailOutreachAdapter, ManualOutreachAdapter, OutlookOutreachAdapter,
+    PublicArtifactContactAdapter, classify_reply,
+)
+from app.routes_outreach import handle_get, handle_post
 
 
 MESSAGE = {'channel': 'email', 'recipient': 'recruiter@company.invalid',
@@ -72,6 +75,46 @@ class OutreachRouteTests(unittest.TestCase):
             'user_authorized_recipient': True, **overrides,
         })
 
+    @patch('app.adapters_outreach.refresh_gmail_token', return_value='inbox-token')
+    @patch('app.adapters_outreach.provider_json')
+    def test_inbox_sync_requires_consent_and_deduplicates(self, provider, token):
+        page = {'messages': [{'id': 'reply-id'}]}
+        message = {
+            'threadId': 'thread-id', 'internalDate': '1700000000000',
+            'snippet': 'We would like to schedule an interview.',
+            'payload': {'headers': [{'name': 'From', 'value': 'recruiter@example.org'},
+                                    {'name': 'Auto-Submitted', 'value': 'auto-replied'}]},
+        }
+        provider.side_effect = [page, message, page, message]
+        sync_path = '/api/inbox/sync'
+        self.assertEqual(handle_post(sync_path, {})[0], 403)
+        self.assertEqual(handle_post(sync_path, {'explicit_inbox_consent': True})[0], 403)
+        provider.assert_not_called()
+        _, status = handle_get('/api/inbox/status')
+        consent = {'explicit_inbox_consent': True, 'sync_token': status['sync_token']}
+        self.assertEqual(handle_post(sync_path, consent)[1]['inserted'], 1)
+        self.assertEqual(handle_post(sync_path, consent)[1]['inserted'], 0)
+        query = parse_qs(provider.call_args_list[0].args[0].full_url.split('?', 1)[1])
+        self.assertIn('label:JobFinder', query['q'][0])
+        self.assertEqual(token.call_args.args[0].name, 'gmail-inbox.json')
+        _, stored = handle_get('/api/inbox/replies')
+        self.assertEqual(len(stored['replies']), 1)
+        self.assertEqual(stored['replies'][0]['classification'], 'automated_receipt')
+        self.assertFalse(stored['replies'][0]['human_verified'])
+
+    def test_simulation_classifies_fixture_without_saving_replies(self):
+        _, simulation = handle_post('/api/inbox/simulate', {})
+        self.assertEqual(simulation['mode'], 'TEST ONLY')
+        self.assertEqual([r['classification'] for r in simulation['replies']],
+                         ['human_positive_reply', 'automated_receipt', 'rejection'])
+        self.assertEqual(handle_get('/api/inbox/replies')[1]['replies'], [])
+
+    def test_referral_info_and_quoted_interview(self):
+        sender = 'recruiter@example.org'
+        self.assertEqual(classify_reply(sender, 'Re: Application', 'I can refer you.'), 'referral_opportunity')
+        self.assertEqual(classify_reply(sender, 'Re: Application', 'Please send your portfolio.'), 'request_for_info')
+        self.assertEqual(classify_reply(sender, 'Re: Application', 'Thanks.\n> Please schedule an interview.'), 'unknown')
+
     def action(self, draft, action, **overrides):
         return handle_post(f"/api/networking/outreach/{draft['id']}/{action}", {
             'explicit_user_approval': True, 'review_token': draft['review_token'], **overrides,
@@ -94,7 +137,7 @@ class OutreachRouteTests(unittest.TestCase):
         self.assertEqual(self.action(draft, 'send', review_token='incorrect')[0], 403)
         self.assertEqual(self.action(draft, 'send')[1]['provider_message_id'], 'gmail-id')
         self.assertEqual(self.action(draft, 'send')[0], 409)
-        self.assertEqual(self.approve(self.stage()[1])[0], 409)
+        self.assertEqual(self.stage()[0], 409)
         provider.assert_called_once()
         row = db.row('SELECT * FROM outreach WHERE id=?', (draft['id'],))
         self.assertTrue(row['sent_at'])
@@ -112,7 +155,48 @@ class OutreachRouteTests(unittest.TestCase):
         self.assertEqual(self.action(draft, 'send')[0], 403)
         with db.connection() as con:
             con.execute('UPDATE contacts SET opted_out=1')
-        self.assertEqual(self.approve(self.stage()[1])[0], 409)
+        self.assertEqual(self.stage()[0], 409)
+
+    def test_artifact_requires_employer_evidence_and_preserves_opt_out(self):
+        source = 'https://company.com/team'
+        job = {'source_url': source, 'company': 'Test Company'}
+        person = {'@type': 'Person', 'name': 'Taylor Recruiter', 'jobTitle': 'Recruiter',
+                  'worksFor': {'name': job['company']}, 'description': 'Leads technical recruiting.'}
+        adapter = PublicArtifactContactAdapter()
+        self.assertEqual(adapter.extract(job, [{**person, 'description': ''}]), [])
+        self.assertEqual(adapter.extract(job, [{**person, 'worksFor': 'Other Company'}]), [])
+        contacts = adapter.extract(job, [person])
+        self.assertIsNone(contacts[0].professional_email)
+        with patch.object(PublicArtifactContactAdapter, 'research', return_value=contacts):
+            _, status = handle_get('/api/inbox/status')
+            args = {'job_id': self.job_id, 'source_url': source, 'employer_source_confirmed': True,
+                    'sync_token': status['sync_token']}
+            _, result = handle_post('/api/networking/contacts/research', args)
+            contact = result['contacts'][0]
+            draft_args = {'contact_id': contact['id']}
+            draft = handle_post('/api/networking/contacts/draft', draft_args)[1]
+            self.assertIn(source, draft['body'])
+            self.assertEqual(handle_post(f'/api/networking/contacts/{contact["id"]}/opt-out', status)[0], 200)
+            handle_post('/api/networking/contacts/research', args)
+            self.assertEqual(handle_post('/api/networking/contacts/draft', draft_args)[0], 409)
+
+    def test_callback_uses_exact_confirmed_application_snapshot(self):
+        packet = {'diff_summary': ['Moved an existing project'], 'submitted_answers': {'availability': 'May'},
+                  'probe_questions': ['What did you build?']}
+        with db.connection() as con:
+            app_id = con.execute(
+                """INSERT INTO applications(job_id,tailored_resume,fit_score,status,confirmation,callback_packet_json)
+                   VALUES(?,'resume',80,'confirmed','ats-receipt',?)""", (self.job_id, json.dumps(packet)),
+            ).lastrowid
+            reply_id = con.execute(
+                "INSERT INTO replies(provider_message_id,classification) VALUES('reply-123','interview_invitation')",
+            ).lastrowid
+        self.assertIsNone(handle_get('/api/inbox/replies')[1]['replies'][0]['callback_packet'])
+        token = handle_get('/api/inbox/status')[1]['sync_token']
+        self.assertEqual(handle_post('/api/inbox/link-application', {
+            'sync_token': token, 'reply_id': reply_id, 'application_id': app_id,
+        })[0], 200)
+        self.assertEqual(handle_get('/api/inbox/replies')[1]['replies'][0]['callback_packet'], packet)
 
     def test_rejects_demo_jobs_unauthorized_addresses_and_multiple_recipients(self):
         self.assertEqual(self.stage(job_id=1)[0], 403)

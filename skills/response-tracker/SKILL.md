@@ -27,3 +27,7 @@ If the needed website, email provider, AI model or file tool is not connected or
 
 ## Related resources
 See `../../prompts/system_prompt.md`, `../../docs/SECURITY_AND_CONSENT.md`, and `../../schemas/` in the full project distribution.
+
+## Differentiator workflow
+
+For D2, link a reply to a confirmed application before displaying the exact saved callback snapshot. Keep suggested classifications separate from human verification. Exclude automated receipts and synthetic fixtures from live response evidence.

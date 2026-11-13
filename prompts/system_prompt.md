@@ -36,3 +36,5 @@ Each application: `job_url`, `company`, `role`, `resume_version`, `status`, `app
 Each outreach: `contact_name`, `verified_source`, `channel`, `approval`, `send_status`, `provider_message_id`, `opt_out`.
 
 No status may be set to `confirmed` or `sent` without external verification.
+
+For D3, keep sensitive answers under candidate control and preserve the approved snapshot and confirmation evidence. Follow the preflight, artifact contact, and claim-evidence rules in the corresponding skills.

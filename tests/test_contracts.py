@@ -90,7 +90,8 @@ class ContractAndFoundationTests(unittest.TestCase):
         self.assertIsNone(routes_pipeline.handle_get('/api/networking/status'))
         self.assertIsNone(routes_outreach.handle_get('/api/pipeline/status'))
         self.assertEqual(routes_pipeline.handle_post('/api/pipeline/gaps', {})[0], 501)
-        self.assertEqual(routes_outreach.handle_post('/api/inbox/sync', {})[0], 501)
+        self.assertIsNone(routes_pipeline.handle_post('/api/inbox/sync', {}))
+        self.assertEqual(routes_outreach.handle_post('/api/inbox/sync', {})[0], 403)
 
 
 if __name__ == '__main__':

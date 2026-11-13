@@ -27,3 +27,7 @@ If the needed website, email provider, AI model or file tool is not connected or
 
 ## Related resources
 See `../../prompts/system_prompt.md`, `../../docs/SECURITY_AND_CONSENT.md`, and `../../schemas/` in the full project distribution.
+
+## Differentiator workflow
+
+Run D1 preflight on permitted sources. Record ATS family, posting date and liveness evidence, and flag scam or friction signals with reasons. Use pasted descriptions when access is blocked.

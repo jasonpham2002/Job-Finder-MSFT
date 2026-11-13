@@ -9,22 +9,27 @@ touching app/server.py or Owner A files.
 import json
 import os
 import re
+from dataclasses import asdict
 from datetime import datetime, timezone
 from email.errors import HeaderParseError
 from email.headerregistry import Address
 from hashlib import sha256
+from http.client import HTTPException
 from pathlib import Path
 from secrets import compare_digest, token_urlsafe
+from urllib.error import HTTPError
 from urllib.parse import urlsplit
 
 from . import db
 from .adapters_outreach import (
-    GmailOutreachAdapter, ManualOutreachAdapter, OutlookOutreachAdapter,
-    classify_reply, generate_outreach_draft,
+    GmailInboxAdapter, GmailOutreachAdapter, ManualOutreachAdapter, OutlookOutreachAdapter,
+    PublicArtifactContactAdapter, classify_reply, generate_outreach_draft,
 )
 
 OUTREACH_PATH = re.compile(r'/api/networking/outreach/([0-9]+)/(approve|send|manual-sent)')
 EMAIL_PROVIDERS = {'gmail': GmailOutreachAdapter, 'outlook': OutlookOutreachAdapter, 'manual': ManualOutreachAdapter}
+INBOX_SYNC_TOKEN = token_urlsafe(32)
+CONTACT_OPTOUT_PATH = re.compile(r'/api/networking/contacts/([0-9]+)/opt-out')
 
 
 def audit(con, outreach_id, action, details):
@@ -77,11 +82,19 @@ def create_delivery_draft(payload):
     if not public_link(source_url):
         raise ValueError('Provide the public source or professional profile for the recipient.')
     with db.connection() as con:
+        con.execute('BEGIN IMMEDIATE')
         job = con.execute('SELECT * FROM jobs WHERE id=?', (int(payload.get('job_id', 0)),)).fetchone()
         if job is None:
             return 404, {'error': 'Unknown job ID.'}
         if job['origin'] in ('fictional-sample', 'demo') or not public_link(job['url']):
             return 403, {'error': 'Delivery requires a real job and its source URL.'}
+        blocked = delivery_block(con, {
+            'id': 0, 'company': job['company'], 'contact_name': name, 'opted_out': False,
+            'public_email': recipient if channel == 'email' else '',
+            'linkedin_url': recipient if channel == 'linkedin' else '',
+        })
+        if blocked:
+            return 409, {'error': blocked}
         contact_id = con.execute(
             '''INSERT INTO contacts(job_id,company,name,role,source_url,public_email,linkedin_url,verification_status)
                VALUES(?,?,?,?,?,?,?,'user_provided')''',
@@ -102,6 +115,16 @@ def create_delivery_draft(payload):
                  'recipient': recipient, 'subject': subject, 'body': body}
 
 
+def cooldown_days():
+    config_path = Path(__file__).resolve().parents[1] / 'config.json'
+    if not config_path.is_file():
+        return 14
+    days = json.loads(config_path.read_text(encoding='utf8')).get('company_outreach_cooldown_days', 14)
+    if type(days) is not int or days < 1:
+        raise ValueError('company_outreach_cooldown_days must be a positive integer.')
+    return days
+
+
 def delivery_block(con, row):
     # Compare all matching contacts so a new draft cannot bypass a previous opt-out.
     destination = row['public_email'] or row['linkedin_url']
@@ -120,12 +143,130 @@ def delivery_block(con, row):
              lower(trim(j.company))=lower(trim(?)) OR lower(c.public_email)=lower(?)
              OR lower(rtrim(c.linkedin_url,'/'))=lower(?))
            AND (o.status IN ('sending','unknown')
-                OR (o.status IN ('sent','manual_sent') AND datetime(o.sent_at)>datetime('now','-14 days')))''',
-        (row['id'], row['company'], destination, destination),
+                OR (o.status IN ('sent','manual_sent') AND datetime(o.sent_at)>datetime('now',?)))''',
+        (row['id'], row['company'], destination, destination, f'-{cooldown_days()} days'),
     ).fetchone()
     if recent:
         return 'Recent or unresolved outreach blocks delivery. Check the previous message first.'
     return None
+
+
+def research_contacts(payload):
+    job = db.row('SELECT * FROM jobs WHERE id=?', (int(payload.get('job_id', 0)),))
+    if not job:
+        return 404, {'error': 'Unknown job ID.'}
+    source = str(payload.get('source_url', '')).strip()
+    if job['origin'] in ('fictional-sample', 'demo'):
+        return 400, {'error': 'Import a real job before researching contacts.'}
+    if not public_link(source) or payload.get('employer_source_confirmed') is not True:
+        return 400, {'error': 'Confirm a public source published by this employer.'}
+    try:
+        contacts = PublicArtifactContactAdapter().research({**job, 'source_url': source})
+    except (OSError, HTTPException, ValueError, TypeError):
+        contacts = []
+    results = []
+    with db.connection() as con:
+        con.execute('BEGIN IMMEDIATE')
+        for contact in contacts:
+            artifact = contact.artifact_hook
+            existing = con.execute(
+                'SELECT id FROM contacts WHERE job_id=? AND name=? AND source_url=?',
+                (job['id'], contact.name, source),
+            ).fetchone()
+            values = (contact.title, contact.professional_email or '', artifact['type'], artifact['title'],
+                      artifact['url'], artifact['snippet'])
+            if existing:
+                contact_id = existing['id']
+                con.execute(
+                    '''UPDATE contacts SET role=?,public_email=?,artifact_type=?,artifact_title=?,
+                       artifact_url=?,artifact_snippet=?,verification_status='verified_public' WHERE id=?''',
+                    (*values, contact_id),
+                )
+            else:
+                contact_id = con.execute(
+                    '''INSERT INTO contacts(job_id,company,name,source_url,role,public_email,artifact_type,
+                       artifact_title,artifact_url,artifact_snippet,verification_status)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,'verified_public')''',
+                    (job['id'], job['company'], contact.name, source, *values),
+                ).lastrowid
+            results.append({**asdict(contact), 'id': contact_id})
+    return 200, {'contacts': results, 'manual_queries': [] if results else [
+        f'"{job["company"]}" "{job["title"]}" team bio',
+        f'"{job["company"]}" recruiting team careers',
+    ]}
+
+
+def opt_out_contact(contact_id, payload):
+    if payload.get('sync_token') != INBOX_SYNC_TOKEN:
+        return 403, {'error': 'Open JobFinder to update the contact.'}
+    with db.connection() as con:
+        updated = con.execute('UPDATE contacts SET opted_out=1 WHERE id=?', (contact_id,))
+        if not updated.rowcount:
+            return 404, {'error': 'Unknown contact.'}
+    return 200, {'opted_out': True}
+
+
+def llm_outreach_enabled():
+    value = os.getenv('JOBFINDER_LLM_OUTREACH')
+    if value is not None:
+        return value == '1'
+    try:
+        from .adapters_pipeline import load_local_env
+    except ModuleNotFoundError as exc:
+        if exc.name != 'app.adapters_pipeline':
+            raise
+        return False
+
+    return load_local_env().get('JOBFINDER_LLM_OUTREACH') == '1'
+
+
+def artifact_draft(payload):
+    contact = db.row('SELECT * FROM contacts WHERE id=?', (int(payload.get('contact_id', 0)),))
+    if not contact or contact['verification_status'] != 'verified_public' or not contact['artifact_snippet']:
+        return 400, {'error': 'Select a verified contact with a public artifact first.'}
+    job = db.row('SELECT * FROM jobs WHERE id=?', (contact['job_id'],))
+    channel = payload.get('channel', 'email')
+    if not job or channel not in ('email', 'linkedin'):
+        return 400, {'error': 'Select a valid job and outreach channel.'}
+    with db.connection() as con:
+        blocked = delivery_block(con, {**contact, 'id': 0, 'contact_name': contact['name']})
+    if blocked:
+        return 409, {'error': blocked}
+    artifact = {key: contact['artifact_' + key] for key in ('type', 'title', 'url', 'snippet')}
+    subject = f'Question about the {job["title"]} role'[:200] if channel == 'email' else ''
+    body = (f'Hi {contact["name"]}, I found your bio on the {job["company"]} website ({artifact["url"]}). '
+            f'I’m interested in the {job["title"]} role. '
+            'Would you be open to sharing what the team looks for in candidates?')
+    if llm_outreach_enabled():
+        try:
+            from .adapters_pipeline import UnifiedModelAdapter
+        except ModuleNotFoundError as exc:
+            if exc.name != 'app.adapters_pipeline':
+                raise
+        else:
+            resume = db.row('SELECT resume FROM profile WHERE id=1')['resume']
+            try:
+                generated = generate_outreach_draft(UnifiedModelAdapter(), resume, job, {
+                    'name': contact['name'], 'role': contact['role'], 'artifact_hook': artifact,
+                }, channel)
+                subject, body = generated['subject'], generated['body']
+            except (ValueError, RuntimeError, OSError):
+                pass
+    return 200, {'subject': subject, 'body': body, 'status': 'draft', 'artifact_hook': artifact}
+
+
+def callback_packet(reply_id):
+    linked = db.row(
+        """SELECT a.callback_packet_json FROM replies r JOIN applications a ON a.id=r.application_id
+           WHERE r.id=? AND r.classification IN ('human_positive_reply','interview_invitation',
+           'referral_opportunity','request_for_info') AND a.status='confirmed' AND a.confirmation!=''""",
+        (reply_id,),
+    )
+    try:
+        packet = json.loads(linked['callback_packet_json']) if linked else None
+    except (TypeError, ValueError):
+        packet = None
+    return packet if isinstance(packet, dict) and packet else None
 
 
 def handle_delivery(outreach_id, action, payload):
@@ -232,14 +373,47 @@ def handle_delivery(outreach_id, action, payload):
         response.update(provider_message_id=message_id, sent_at=sent_at)
     return 200, response
 
+def sync_inbox(payload):
+    if (not isinstance(payload, dict) or payload.get('explicit_inbox_consent') is not True
+            or payload.get('sync_token') != INBOX_SYNC_TOKEN):
+        return 403, {'error': 'Confirm read-only sync of Gmail messages labeled JobFinder.'}
+    try:
+        replies = GmailInboxAdapter().sync(connection=None)
+    except FileNotFoundError:
+        return 409, {'error': 'Run python -m app.adapters_outreach authorize-gmail-inbox first.'}
+    except HTTPError as exc:
+        return 502, {'error': f'Gmail inbox sync failed (HTTP {exc.code}). Check read-only authorization.'}
+    except (OSError, HTTPException, ValueError, KeyError, TypeError):
+        return 502, {'error': 'Gmail inbox sync failed. Check the OAuth configuration and connection.'}
+    with db.connection() as con:
+        before = con.total_changes
+        con.executemany(
+            '''INSERT INTO replies(provider_message_id,thread_id,sender,subject,snippet,classification,received_at)
+               VALUES(?,?,?,?,?,?,?) ON CONFLICT(provider_message_id) DO NOTHING''',
+            [(r.provider_message_id, r.thread_id, r.sender, r.subject, r.snippet, r.classification, r.received_at)
+             for r in replies],
+        )
+        inserted = con.total_changes - before
+    return 200, {'mode': 'gmail', 'scanned': len(replies), 'inserted': inserted}
+
+
 def handle_get(path: str):
     """Return (status_code, payload) if path belongs to Owner B, else None."""
+    if path == '/api/inbox/replies':
+        replies = db.rows(
+            '''SELECT id,provider_message_id,thread_id,sender,subject,snippet,classification,human_verified,received_at
+               FROM replies ORDER BY received_at DESC,id DESC LIMIT 100'''
+        )
+        for reply in replies:
+            reply['callback_packet'] = callback_packet(reply['id'])
+        return 200, {'mode': 'gmail', 'replies': replies}
     if path in ('/api/networking/status', '/api/inbox/status'):
         return 200, {
             'owner': 'Owner B',
             'scope': ['contacts_d4', 'outreach_oauth', 'cooldown_optout', 'inbox_sync', 'callback_ui'],
             'implemented': False,
-            'available': ['outreach_delivery'] if path == '/api/networking/status' else ['fictional_inbox'],
+            'available': ['outreach_delivery'] if path == '/api/networking/status' else ['fictional_inbox', 'gmail_sync'],
+            **({'sync_token': INBOX_SYNC_TOKEN} if path == '/api/inbox/status' else {}),
             'note': 'See plans/OWNER_B_WORKBOOK.md for the remaining work.',
         }
     if path.startswith('/api/networking/') or path.startswith('/api/inbox/'):
@@ -253,6 +427,16 @@ def handle_get(path: str):
 
 def handle_post(path: str, payload: dict):
     """Return (status_code, payload) if path belongs to Owner B, else None."""
+    if path == '/api/inbox/link-application':
+        if not isinstance(payload, dict) or payload.get('sync_token') != INBOX_SYNC_TOKEN:
+            return 403, {'error': 'Open Inbox Tracker to link a reply.'}
+        with db.connection() as con:
+            updated = con.execute(
+                """UPDATE replies SET application_id=? WHERE id=? AND EXISTS (
+                   SELECT 1 FROM applications WHERE id=? AND status='confirmed' AND confirmation!='')""",
+                (payload.get('application_id'), payload.get('reply_id'), payload.get('application_id')),
+            )
+        return (200, {'linked': True}) if updated.rowcount else (404, {'error': 'Reply or confirmed application not found.'})
     if path == '/api/networking/outreach/drafts' or (match := OUTREACH_PATH.fullmatch(path)):
         if not isinstance(payload, dict):
             return 400, {'error': 'Expected a JSON object.'}
@@ -262,6 +446,23 @@ def handle_post(path: str, payload: dict):
             return handle_delivery(int(match[1]), match[2], payload)
         except (ValueError, TypeError) as exc:
             return 400, {'error': str(exc)}
+    if path in ('/api/networking/contacts/research', '/api/networking/contacts/draft') or (
+        opt_out := CONTACT_OPTOUT_PATH.fullmatch(path)
+    ):
+        if not isinstance(payload, dict):
+            return 400, {'error': 'Expected a JSON object.'}
+        try:
+            if path == '/api/networking/contacts/research':
+                if payload.get('sync_token') != INBOX_SYNC_TOKEN:
+                    return 403, {'error': 'Open JobFinder to research an employer source.'}
+                return research_contacts(payload)
+            if path == '/api/networking/contacts/draft':
+                return artifact_draft(payload)
+            return opt_out_contact(int(opt_out[1]), payload)
+        except (ValueError, TypeError) as exc:
+            return 400, {'error': str(exc)}
+    if path == '/api/inbox/sync':
+        return sync_inbox(payload)
     if path == '/api/inbox/simulate':
         fixture = Path(__file__).resolve().parents[1] / 'sample_data' / 'fictional_inbox.json'
         messages = json.loads(fixture.read_text(encoding='utf-8'))
@@ -271,8 +472,22 @@ def handle_post(path: str, payload: dict):
             )}
             for message in messages
         ]}
-    if path == '/api/outreach/prepare' and os.getenv('JOBFINDER_LLM_OUTREACH') == '1':
-        return prepare_llm_draft(payload)
+    if path == '/api/outreach/prepare' and isinstance(payload, dict):
+        contact = payload.get('contact') or {}
+        if not isinstance(contact, dict):
+            return 400, {'error': 'Provide a contact record.'}
+        job = db.row('SELECT company FROM jobs WHERE id=?', (int(payload.get('job_id', 0)),))
+        if job:
+            with db.connection() as con:
+                blocked = delivery_block(con, {
+                    'id': 0, 'company': job['company'], 'contact_name': str(contact.get('name', '')).strip(),
+                    'opted_out': False, 'public_email': str(contact.get('email', '')).strip(),
+                    'linkedin_url': str(contact.get('profile', '')).strip().rstrip('/'),
+                })
+            if blocked:
+                return 409, {'error': blocked}
+        if llm_outreach_enabled():
+            return prepare_llm_draft(payload)
     if path.startswith('/api/networking/') or path.startswith('/api/inbox/'):
         return 501, {
             'error': 'Owner B endpoint not implemented yet.',
