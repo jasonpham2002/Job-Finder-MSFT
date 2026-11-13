@@ -1,7 +1,8 @@
-"""Python standard-library demo web server. Run: python -m app.server
+"""Python standard-library local web server (thin frozen router).
 
-All outbound side effects are intentionally disabled. Students must implement
-verified, authorized adapters. The UI never labels demo activity as real.
+Run: python -m app.server
+Delegates Owner A routes (/api/pipeline/*) to app/routes_pipeline.py and
+Owner B routes (/api/networking/*, /api/inbox/*) to app/routes_outreach.py.
 """
 import json
 import os
@@ -9,7 +10,7 @@ import re
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib import parse
-from . import db, engine
+from . import db, engine, routes_pipeline, routes_outreach
 
 ROOT = Path(__file__).resolve().parents[1]
 WEB = ROOT / 'web'
@@ -28,12 +29,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def read_json(self):
         length = int(self.headers.get('Content-Length', '0'))
-        if length > 80_000:
-            raise ValueError('Request too large (80 KB maximum).')
-        return json.loads(self.rfile.read(length or 0).decode('utf8'))
+        if length > 200_000:
+            raise ValueError('Request too large (200 KB maximum).')
+        if length == 0:
+            return {}
+        return json.loads(self.rfile.read(length).decode('utf8'))
 
     def do_GET(self):
         path = parse.urlsplit(self.path).path
+        for module in (routes_pipeline, routes_outreach):
+            delegated = module.handle_get(path)
+            if delegated is not None:
+                status, payload = delegated
+                return self.json_response(payload, status)
         if path == '/api/jobs':
             return self.json_response(db.rows('SELECT * FROM jobs ORDER BY id DESC'))
         if path == '/api/profile':
@@ -43,10 +51,14 @@ class Handler(BaseHTTPRequestHandler):
         if path == '/api/outreach':
             return self.json_response(db.rows('''SELECT o.*, j.title, j.company FROM outreach o JOIN jobs j ON j.id=o.job_id ORDER BY o.id DESC'''))
         if path == '/api/summary':
-            return self.json_response({'jobs': db.row('SELECT COUNT(*) AS n FROM jobs')['n'],
+            return self.json_response({
+                'jobs': db.row('SELECT COUNT(*) AS n FROM jobs')['n'],
                 'prepared': db.row('SELECT COUNT(*) AS n FROM applications')['n'],
                 'demo_submitted': db.row("SELECT COUNT(*) AS n FROM applications WHERE status='test_submitted'")['n'],
-                'real_submitted': 0, 'outreach_drafts': db.row('SELECT COUNT(*) AS n FROM outreach')['n'], 'real_outreach_sent': 0})
+                'real_submitted': db.row("SELECT COUNT(*) AS n FROM applications WHERE status='confirmed' AND confirmation!=''")['n'],
+                'outreach_drafts': db.row('SELECT COUNT(*) AS n FROM outreach')['n'],
+                'real_outreach_sent': db.row("SELECT COUNT(*) AS n FROM outreach WHERE status='sent' AND provider_message_id!=''")['n'],
+            })
         if path == '/':
             path = '/index.html'
         filepath = (WEB / path.lstrip('/')).resolve()
@@ -63,6 +75,11 @@ class Handler(BaseHTTPRequestHandler):
         path = parse.urlsplit(self.path).path
         try:
             payload = self.read_json()
+            for module in (routes_pipeline, routes_outreach):
+                delegated = module.handle_post(path, payload)
+                if delegated is not None:
+                    status, body = delegated
+                    return self.json_response(body, status)
             if path == '/api/profile':
                 resume = str(payload.get('resume', '')).strip()
                 if len(resume) < 50:
@@ -123,7 +140,7 @@ class Handler(BaseHTTPRequestHandler):
                 draft = engine.draft_message(contact, job, resume, str(payload.get('channel', 'email')))
                 with db.connection() as con:
                     con.execute('''INSERT INTO outreach(job_id,contact_name,contact_role,contact_profile,subject,body)
-                        VALUES(?,?,?,?,?,?)''', (job_id,name,role,str(contact.get('profile','')),draft['subject'],draft['body']))
+                        VALUES(?,?,?,?,?,?)''', (job_id, name, role, str(contact.get('profile', '')), draft['subject'], draft['body']))
                 return self.json_response(draft)
             m = re.fullmatch(r'/api/applications/(\d+)/approve', path)
             if m:

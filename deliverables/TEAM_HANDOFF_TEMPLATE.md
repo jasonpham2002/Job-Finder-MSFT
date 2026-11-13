@@ -42,6 +42,11 @@ Ran with a second AI provider: yes / no
 Items needing re-authentication: __________
 Known limitations/bugs: __________
 
+## Current Scaffold Baseline (Honesty Status)
+
+- **Real / Live today:** Local HTTP dashboard (`127.0.0.1:8765`), SSRF-checked public HTML + `schema.org/JobPosting` parser with manual paste fallback, SQLite persistence with idempotent migrations, typed adapter & schema contracts (`D1`–`D5`), modular Owner A/B route & UI seams, and portable `SKILL.md` packaging.
+- **Test / Stubbed today (must be implemented & updated above before final judging):** `ModelAdapter`, PDF/DOCX `ResumeFileAdapter`, `JobDiscoveryAdapter`, `ApplicationAdapter` real submissions, `ProfessionalContactAdapter`, `OutreachAdapter` real email sending, and `InboxAdapter` live sync all remain offline/stubbed (`501`/`NotImplementedError`), and `real_submitted` / `real_outreach_sent` remain `0` until teammates wire live credentials and record real confirmations.
+
 ## Privacy and validation
 
 - [ ] No secrets or personal user data inside ZIP

@@ -1,6 +1,8 @@
 {
   "mode": "demo",
   "ai_provider": "none",
+  "llm_provider": "auto",
+  "email_provider": "gmail",
   "preferred_role_terms": ["Solutions Engineer", "Customer Success", "Sales Operations"],
   "locations": ["Dallas, TX", "Remote USA"],
   "minimum_salary_usd": null,
@@ -11,6 +13,9 @@
   "require_outreach_review": true,
   "max_contacts_per_company": 3,
   "max_messages_per_contact": 1,
+  "company_outreach_cooldown_days": 14,
+  "enable_preflight_checks": true,
+  "enable_playwright_hitl": false,
   "enable_real_apply": false,
   "enable_real_send": false,
   "enabled_application_adapters": [],

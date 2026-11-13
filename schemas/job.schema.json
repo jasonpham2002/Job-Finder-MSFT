@@ -31,6 +31,18 @@
     "source": {
       "type": "string"
     },
+    "ats_family": {
+      "enum": [
+        "greenhouse",
+        "lever",
+        "ashby",
+        "workday",
+        "linkedin",
+        "indeed",
+        "company_site",
+        "unknown"
+      ]
+    },
     "location": {
       "type": [
         "string",
@@ -62,6 +74,47 @@
         "string",
         "null"
       ]
+    },
+    "preflight": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "properties": {
+        "liveness_status": {
+          "enum": [
+            "active",
+            "stale_risk",
+            "closed",
+            "unknown"
+          ]
+        },
+        "scam_risk": {
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ]
+        },
+        "scam_flags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "friction_roi": {
+          "enum": [
+            "high_roi_low_bot_noise",
+            "standard",
+            "saturated_easy_apply",
+            "high_risk"
+          ]
+        },
+        "notes": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
     }
   },
   "additionalProperties": false

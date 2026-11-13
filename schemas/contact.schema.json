@@ -47,6 +47,45 @@
     },
     "opted_out": {
       "type": "boolean"
+    },
+    "artifact_hook": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "required": [
+        "type",
+        "title",
+        "url",
+        "snippet"
+      ],
+      "properties": {
+        "type": {
+          "enum": [
+            "blog_post",
+            "github_repo",
+            "talk",
+            "team_bio",
+            "user_provided"
+          ]
+        },
+        "title": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        },
+        "snippet": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "cooldown_until": {
+      "type": [
+        "string",
+        "null"
+      ]
     }
   },
   "additionalProperties": false

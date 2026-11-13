@@ -1,0 +1,12 @@
+# Project-scoped OpenAI Codex configuration
+# Keeps Codex aligned with Antigravity, AGENTS.md, and portable Agent Skills.
+
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"
+project_doc_fallback_filenames = ["AGENTS.md", "CLAUDE.md"]
+
+[features]
+skills = true
+
+[history]
+persistence = "save-all"

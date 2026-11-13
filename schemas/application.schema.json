@@ -56,6 +56,67 @@
     },
     "notes": {
       "type": "string"
+    },
+    "claim_evidence_map": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "claim",
+          "source_snippet"
+        ],
+        "properties": {
+          "claim": {
+            "type": "string"
+          },
+          "source_snippet": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "slop_warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "ats_preview_text": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "copilot_packet": {
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "callback_packet": {
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "resume_sha256": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "answers_sha256": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "evidence_path": {
+      "type": [
+        "string",
+        "null"
+      ]
     }
   },
   "additionalProperties": false

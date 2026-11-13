@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GapArtifact",
+  "type": "object",
+  "required": [
+    "job_id",
+    "wording_gaps",
+    "skill_gaps"
+  ],
+  "properties": {
+    "job_id": {
+      "type": "string"
+    },
+    "wording_gaps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "job_term",
+          "candidate_evidence"
+        ],
+        "properties": {
+          "job_term": {
+            "type": "string"
+          },
+          "candidate_evidence": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "skill_gaps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "skill_name",
+          "micro_project_brief",
+          "verified"
+        ],
+        "properties": {
+          "skill_name": {
+            "type": "string"
+          },
+          "micro_project_brief": {
+            "type": "string"
+          },
+          "proof_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "verified": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}
