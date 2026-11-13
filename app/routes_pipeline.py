@@ -10,21 +10,30 @@ import binascii
 import hashlib
 import json
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from . import db, engine
 from .adapters_pipeline import (
+    SENSITIVE_FIELDS,
+    ApplicationError,
+    CoPilotApplicationAdapter,
+    DuplicateApplicationError,
     JobDiscoveryError,
     LiveJobDiscoveryAdapter,
     LocalResumeFileAdapter,
     ResumeFileError,
     UnifiedModelAdapter,
+    compute_sha256_text,
     normalize_job_url,
 )
 
 MIN_RESUME_CHARS = 50
 _JOB_PREFLIGHT_RE = re.compile(r'^/api/pipeline/jobs/(\d+)/preflight$')
+_APP_COPILOT_RE = re.compile(r'^/api/pipeline/applications/(\d+)/copilot$')
+_JOB_COPILOT_RE = re.compile(r'^/api/pipeline/jobs/(\d+)/copilot$')
+_APP_CONFIRM_RE = re.compile(r'^/api/pipeline/applications/(\d+)/confirm$')
 
 
 def handle_get(path: str):
@@ -34,14 +43,15 @@ def handle_get(path: str):
             'owner': 'Owner A',
             'scope': ['discovery', 'preflight_d1', 'resume_pdf_docx', 'tailor_d2', 'gaps_d5', 'copilot_d3'],
             'implemented': True,
-            'tasks_completed': ['A-01', 'A-02'],
+            'tasks_completed': ['A-01', 'A-02', 'A-03'],
             'model_adapter': UnifiedModelAdapter.inspect_capabilities(),
             'resume_adapter': {
                 **LocalResumeFileAdapter.inspect_capabilities(),
                 'max_upload_json_bytes': 200_000,
             },
             'discovery_adapter': LiveJobDiscoveryAdapter.inspect_capabilities(),
-            'note': 'Tasks A-01 + A-02 active (ModelAdapter, ResumeFileAdapter, JobDiscoveryAdapter + D1 Pre-Flight); A-03..A-05 pending.',
+            'application_adapter': CoPilotApplicationAdapter.inspect_capabilities(),
+            'note': 'Tasks A-01..A-03 active (ModelAdapter, ResumeFileAdapter, JobDiscoveryAdapter + D1, CoPilotApplicationAdapter + D3); A-04..A-05 pending.',
         }
     if path.startswith('/api/pipeline/'):
         return 501, {
@@ -407,6 +417,313 @@ def _handle_preflight_all() -> tuple[int, dict[str, Any]]:
     }
 
 
+def _safe_json_dict(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return dict(raw)
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except ValueError:
+            pass
+    return {}
+
+
+def _deserialize_application_row(app_row: Any) -> dict[str, Any]:
+    out = dict(app_row)
+    answers_store = _safe_json_dict(out.get('answers_json'))
+    callback_store = _safe_json_dict(out.get('callback_packet_json'))
+    out['answers_data'] = answers_store
+    out['copilot_packet'] = answers_store.get('copilot_packet')
+    out['callback_packet'] = callback_store
+    return out
+
+
+def _get_application_adapter() -> CoPilotApplicationAdapter:
+    return CoPilotApplicationAdapter()
+
+
+def _build_and_save_copilot_packet(app_row: Any, job_row: Any, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    existing_store = _safe_json_dict(app_row['answers_json'])
+    if app_row['status'] == 'confirmed' and existing_store.get('copilot_packet'):
+        # Confirmed application packets stay immutable to preserve tamper-evident receipt integrity.
+        return 200, {
+            'ok': True,
+            'immutable': True,
+            'application': _deserialize_application_row(app_row),
+            'copilot_packet': existing_store['copilot_packet'],
+        }
+
+    profile_row = db.row('SELECT resume FROM profile WHERE id=1')
+    profile_resume = (profile_row or {}).get('resume') or ''
+    approved_resume = str(
+        payload.get('approved_resume')
+        or app_row['tailored_resume']
+        or profile_resume
+    ).strip()
+
+    existing_candidate = _safe_json_dict(existing_store.get('candidate_answers'))
+    new_candidate = _safe_json_dict(payload.get('candidate_answers'))
+    merged_candidate = {**existing_candidate, **{k: str(v) for k, v in new_candidate.items()}}
+
+    existing_sensitive = _safe_json_dict(existing_store.get('sensitive_answers'))
+    new_sensitive = _safe_json_dict(payload.get('sensitive_answers'))
+    merged_sensitive = {**existing_sensitive}
+    for key in SENSITIVE_FIELDS:
+        if key in new_sensitive:
+            merged_sensitive[key] = str(new_sensitive[key])
+
+    try:
+        packet = _get_application_adapter().prepare(
+            dict(job_row),
+            {
+                'resume': profile_resume,
+                'candidate_answers': merged_candidate,
+                'sensitive_answers': merged_sensitive,
+            },
+            approved_resume,
+        )
+    except ApplicationError as exc:
+        return 400, {'error': str(exc)}
+
+    packet_dict = {
+        'job_id': packet.job_id,
+        'ats_family': packet.ats_family,
+        'ordered_sections': packet.ordered_sections,
+        'sensitive_fields_locked': packet.sensitive_fields_locked,
+        'callback_packet': packet.callback_packet,
+    }
+    resume_sha256 = compute_sha256_text(approved_resume)
+    updated_store = {
+        **existing_store,
+        'copilot_packet': packet_dict,
+        'candidate_answers': merged_candidate,
+        'sensitive_answers': merged_sensitive,
+        'sensitive_fields_confirmed': bool(existing_store.get('sensitive_fields_confirmed', False)),
+        'approved': bool(existing_store.get('approved', False)),
+    }
+
+    existing_cb = _safe_json_dict(app_row['callback_packet_json'])
+    merged_cb = {**packet.callback_packet, **existing_cb}
+    if not existing_cb.get('why_this_role'):
+        merged_cb['why_this_role'] = packet.callback_packet.get('why_this_role', '')
+    merged_cb['submitted_answers'] = merged_candidate
+
+    new_tailored = approved_resume if payload.get('approved_resume') else app_row['tailored_resume']
+    with db.connection() as con:
+        con.execute(
+            'UPDATE applications SET tailored_resume=?, answers_json=?, callback_packet_json=?, resume_sha256=? WHERE id=?',
+            (
+                new_tailored,
+                json.dumps(updated_store, ensure_ascii=False),
+                json.dumps(merged_cb, ensure_ascii=False),
+                resume_sha256,
+                app_row['id'],
+            ),
+        )
+
+    refreshed = db.row(
+        'SELECT a.*, j.title, j.company, j.url FROM applications a JOIN jobs j ON j.id=a.job_id WHERE a.id=?',
+        (app_row['id'],),
+    )
+    db.log_audit(
+        'candidate',
+        'copilot_packet_prepared',
+        'application',
+        str(app_row['id']),
+        {'job_id': job_row['id'], 'ats_family': packet.ats_family, 'resume_sha256': resume_sha256},
+    )
+    return 200, {
+        'ok': True,
+        'immutable': False,
+        'application': _deserialize_application_row(refreshed),
+        'copilot_packet': packet_dict,
+    }
+
+
+def _handle_application_copilot(app_id: int, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return 400, {'error': 'Request body must be a JSON object.'}
+    app_row = db.row('SELECT * FROM applications WHERE id=?', (app_id,))
+    if not app_row:
+        return 404, {'error': f'Application {app_id} not found.'}
+    job_row = db.row('SELECT * FROM jobs WHERE id=?', (app_row['job_id'],))
+    if not job_row:
+        return 404, {'error': f'Job {app_row["job_id"]} not found.'}
+    return _build_and_save_copilot_packet(app_row, job_row, payload)
+
+
+def _handle_job_copilot(job_id: int, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return 400, {'error': 'Request body must be a JSON object.'}
+    job_row = db.row('SELECT * FROM jobs WHERE id=?', (job_id,))
+    if not job_row:
+        return 404, {'error': f'Job {job_id} not found.'}
+
+    app_row = db.row('SELECT * FROM applications WHERE job_id=?', (job_id,))
+    if not app_row:
+        profile_row = db.row('SELECT resume FROM profile WHERE id=1')
+        profile_resume = (profile_row or {}).get('resume') or ''
+        if len(profile_resume.strip()) < MIN_RESUME_CHARS:
+            return 400, {'error': f'Save or upload a resume ({MIN_RESUME_CHARS}+ chars) before building a Co-Pilot packet.'}
+        fit = engine.match_resume(profile_resume, job_row['description'])
+        tailored = engine.draft_resume(profile_resume, job_row)
+        with db.connection() as con:
+            con.execute(
+                "INSERT INTO applications(job_id, tailored_resume, fit_score, status) VALUES(?,?,?,'draft') "
+                "ON CONFLICT(job_id) DO NOTHING",
+                (job_id, tailored, fit['score']),
+            )
+        app_row = db.row('SELECT * FROM applications WHERE job_id=?', (job_id,))
+    return _build_and_save_copilot_packet(app_row, job_row, payload)
+
+
+def _find_duplicate_confirmed_application(app_id: int, job_row: Any) -> Any:
+    norm_url = normalize_job_url(job_row['url'] or '')
+    confirmed_rows = db.rows(
+        "SELECT a.id, a.job_id, a.confirmation, j.url FROM applications a JOIN jobs j ON j.id=a.job_id "
+        "WHERE a.status='confirmed' AND a.confirmation!=''"
+    )
+    for row_item in confirmed_rows:
+        if row_item['id'] == app_id or row_item['job_id'] == job_row['id']:
+            return row_item
+        if norm_url and normalize_job_url(row_item['url'] or '') == norm_url:
+            return row_item
+    return None
+
+
+def _handle_application_confirm(app_id: int, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return 400, {'error': 'Request body must be a JSON object.'}
+    app_row = db.row('SELECT * FROM applications WHERE id=?', (app_id,))
+    if not app_row:
+        return 404, {'error': f'Application {app_id} not found.'}
+    job_row = db.row('SELECT * FROM jobs WHERE id=?', (app_row['job_id'],))
+    if not job_row:
+        return 404, {'error': f'Job {app_row["job_id"]} not found.'}
+
+    if app_row['status'] == 'test_submitted':
+        return 400, {
+            'error': 'Test-submitted demo applications stay separate from real applications and cannot be converted to confirmed.'
+        }
+
+    existing_store = _safe_json_dict(app_row['answers_json'])
+    merged_candidate = {
+        **_safe_json_dict(existing_store.get('candidate_answers')),
+        **{k: str(v) for k, v in _safe_json_dict(payload.get('candidate_answers')).items()},
+    }
+    merged_sensitive = dict(_safe_json_dict(existing_store.get('sensitive_answers')))
+    incoming_sensitive = _safe_json_dict(payload.get('sensitive_answers'))
+    for key in SENSITIVE_FIELDS:
+        if key in incoming_sensitive:
+            merged_sensitive[key] = str(incoming_sensitive[key])
+
+    approved_resume = str(payload.get('approved_resume') or app_row['tailored_resume'] or '').strip()
+    explicit_approval = bool(payload.get('explicit_user_approval', False))
+    sensitive_confirmed = bool(payload.get('sensitive_fields_confirmed', False))
+    outcome = str(payload.get('outcome') or 'confirmed').strip().lower()
+    confirmation_reference = str(payload.get('confirmation_reference') or '').strip()
+    evidence_note = str(payload.get('evidence_note') or '').strip()
+    evidence_path = str(payload.get('evidence_path') or '').strip()
+
+    if outcome == 'confirmed':
+        duplicate = _find_duplicate_confirmed_application(app_id, job_row)
+        if duplicate is not None:
+            return 409, {
+                'error': f'Duplicate submission blocked: application #{duplicate["id"]} is already confirmed ({duplicate["confirmation"]}).'
+            }
+
+    prepared_payload = {
+        'job': dict(job_row),
+        'approved_resume': approved_resume,
+        'candidate_answers': merged_candidate,
+        'sensitive_answers': merged_sensitive,
+        'sensitive_fields_confirmed': sensitive_confirmed,
+        'outcome': outcome,
+        'confirmation_reference': confirmation_reference,
+        'evidence_note': evidence_note,
+        'evidence_path': evidence_path,
+    }
+    try:
+        result = _get_application_adapter().submit(prepared_payload, explicit_user_approval=explicit_approval)
+    except PermissionError as exc:
+        return 403, {'error': str(exc)}
+    except DuplicateApplicationError as exc:
+        return 409, {'error': str(exc)}
+    except ApplicationError as exc:
+        return 400, {'error': str(exc)}
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    stored_confirmation = result.confirmation_id or ''
+    updated_store = {
+        **existing_store,
+        'candidate_answers': merged_candidate,
+        'sensitive_answers': merged_sensitive,
+        'sensitive_fields_confirmed': True,
+        'approved': True,
+        'approved_at': existing_store.get('approved_at') or now_iso,
+        'confirmation_reference': stored_confirmation or None,
+        'evidence_path': result.evidence_path,
+        'outcome': result.status,
+    }
+    callback_store = _safe_json_dict(app_row['callback_packet_json'])
+    callback_store['submitted_answers'] = {**merged_candidate, 'sensitive_fields_confirmed': True}
+
+    with db.connection() as con:
+        con.execute(
+            'UPDATE applications SET tailored_resume=?, status=?, confirmation=?, answers_json=?, '
+            'callback_packet_json=?, resume_sha256=?, answers_sha256=?, evidence_note=?, submitted_at=? WHERE id=?',
+            (
+                approved_resume,
+                result.status,
+                stored_confirmation,
+                json.dumps(updated_store, ensure_ascii=False),
+                json.dumps(callback_store, ensure_ascii=False),
+                result.resume_sha256 or '',
+                result.answers_sha256 or '',
+                evidence_note or result.details,
+                now_iso,
+                app_id,
+            ),
+        )
+
+    db.log_audit(
+        'candidate',
+        f'application_{result.status}',
+        'application',
+        str(app_id),
+        {
+            'job_id': job_row['id'],
+            'ats_family': job_row['ats_family'] or engine.detect_ats_family(job_row['url'] or ''),
+            'status': result.status,
+            'confirmation_reference': stored_confirmation,
+            'resume_sha256': result.resume_sha256,
+            'answers_sha256': result.answers_sha256,
+            'sensitive_fields_confirmed': True,
+        },
+    )
+
+    refreshed = db.row(
+        'SELECT a.*, j.title, j.company, j.url FROM applications a JOIN jobs j ON j.id=a.job_id WHERE a.id=?',
+        (app_id,),
+    )
+    return 200, {
+        'ok': True,
+        'real_submitted_counted': bool(result.status == 'confirmed' and stored_confirmation),
+        'receipt': {
+            'status': result.status,
+            'confirmation_reference': stored_confirmation or None,
+            'resume_sha256': result.resume_sha256,
+            'answers_sha256': result.answers_sha256,
+            'evidence_path': result.evidence_path,
+            'submitted_at': now_iso,
+            'details': result.details,
+        },
+        'application': _deserialize_application_row(refreshed),
+    }
+
+
 def handle_post(path: str, payload: dict):
     """Return (status_code, payload) if path belongs to Owner A, else None."""
     if path == '/api/pipeline/resume/upload':
@@ -420,6 +737,15 @@ def handle_post(path: str, payload: dict):
     preflight_match = _JOB_PREFLIGHT_RE.match(path)
     if preflight_match:
         return _handle_job_preflight(int(preflight_match.group(1)))
+    app_copilot_match = _APP_COPILOT_RE.match(path)
+    if app_copilot_match:
+        return _handle_application_copilot(int(app_copilot_match.group(1)), payload)
+    job_copilot_match = _JOB_COPILOT_RE.match(path)
+    if job_copilot_match:
+        return _handle_job_copilot(int(job_copilot_match.group(1)), payload)
+    confirm_match = _APP_CONFIRM_RE.match(path)
+    if confirm_match:
+        return _handle_application_confirm(int(confirm_match.group(1)), payload)
     if path.startswith('/api/pipeline/'):
         return 501, {
             'error': 'Owner A endpoint not implemented yet.',

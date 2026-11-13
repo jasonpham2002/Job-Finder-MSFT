@@ -18,11 +18,20 @@ import zlib
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional
 
-from datetime import datetime
+import hashlib
+from datetime import datetime, timezone
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from . import engine
-from .adapters import JobDiscoveryAdapter, JobPreflight, ModelAdapter, ResumeFileAdapter
+from .adapters import (
+    ActionResult,
+    ApplicationAdapter,
+    CoPilotPacket,
+    JobDiscoveryAdapter,
+    JobPreflight,
+    ModelAdapter,
+    ResumeFileAdapter,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 PROMPTS_DIR = ROOT / 'prompts'
@@ -1376,4 +1385,422 @@ class LiveJobDiscoveryAdapter(JobDiscoveryAdapter):
             'deduped_count': len(deduped),
         }
         return deduped
+
+
+# ---------------------------------------------------------------------------
+# Task A-03: CoPilotApplicationAdapter (D3 Co-Pilot Packet + Sensitive Gate + SHA-256 Receipts)
+# ---------------------------------------------------------------------------
+
+SENSITIVE_FIELDS: tuple[str, ...] = (
+    'work_authorization',
+    'visa_sponsorship',
+    'salary_expectation',
+    'veteran_status',
+    'disability_status',
+    'references',
+)
+_REQUIRED_SENSITIVE_FIELDS = {'work_authorization', 'visa_sponsorship'}
+_COPILOT_VALID_OUTCOMES = ('confirmed', 'manual_required', 'unknown', 'failed')
+_DISALLOWED_PLACEHOLDERS = {'', 'tbd', 'todo', 'ai_placeholder', 'unknown', 'n/a_ai'}
+
+_PORTAL_SECTION_FLOWS: dict[str, tuple[str, ...]] = {
+    'workday': (
+        'portal_preflight',
+        'contact_info',
+        'work_history',
+        'resume_and_links',
+        'custom_questions',
+        'sensitive_eligibility_locked',
+    ),
+    'greenhouse': (
+        'contact_info',
+        'resume_and_links',
+        'work_history',
+        'custom_questions',
+        'sensitive_eligibility_locked',
+    ),
+    'lever': (
+        'contact_info',
+        'resume_and_links',
+        'work_history',
+        'custom_questions',
+        'sensitive_eligibility_locked',
+    ),
+    'ashby': (
+        'contact_info',
+        'resume_and_links',
+        'work_history',
+        'custom_questions',
+        'sensitive_eligibility_locked',
+    ),
+}
+_DEFAULT_PORTAL_FLOW: tuple[str, ...] = (
+    'contact_info',
+    'resume_and_links',
+    'work_history',
+    'custom_questions',
+    'sensitive_eligibility_locked',
+)
+
+_SENSITIVE_FIELD_PROMPTS: dict[str, tuple[str, str]] = {
+    'work_authorization': (
+        'Work Authorization',
+        'e.g. Authorized to work in US without sponsorship',
+    ),
+    'visa_sponsorship': (
+        'Visa Sponsorship Required',
+        'e.g. No / Yes (specify visa type)',
+    ),
+    'salary_expectation': (
+        'Compensation / Salary Expectation',
+        'Candidate-entered figure or Negotiable',
+    ),
+    'veteran_status': (
+        'Veteran Status (EEO)',
+        'Candidate choice or Decline to self-identify',
+    ),
+    'disability_status': (
+        'Disability Status (EEO)',
+        'Candidate choice or Decline to self-identify',
+    ),
+    'references': (
+        'Professional References',
+        'Candidate-approved contact details only or Available upon request',
+    ),
+}
+
+_EMAIL_RE = re.compile(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}')
+_PHONE_RE = re.compile(r'(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}')
+_LINKEDIN_RE = re.compile(r'https?://(?:www\.)?linkedin\.com/in/[A-Za-z0-9._%-]+/?', re.IGNORECASE)
+_GITHUB_RE = re.compile(r'https?://(?:www\.)?github\.com/[A-Za-z0-9._-]+/?', re.IGNORECASE)
+_HEADING_SKIP = {
+    'resume',
+    'curriculum vitae',
+    'summary',
+    'profile',
+    'experience',
+    'work experience',
+    'education',
+    'skills',
+    'projects',
+}
+
+
+class ApplicationError(ValueError):
+    """Raised when an application packet or confirmation violates consent or verification rules."""
+
+
+class DuplicateApplicationError(ApplicationError):
+    """Raised when attempting to record a duplicate confirmed real application for the same job."""
+
+
+def compute_sha256_text(text: str) -> str:
+    """Return canonical UTF-8 SHA-256 hex digest for resume or text artifacts."""
+    return hashlib.sha256(str(text or '').encode('utf-8')).hexdigest()
+
+
+def compute_answers_sha256(payload: Mapping[str, Any]) -> str:
+    """Return deterministic sorted-JSON SHA-256 hex digest for submitted application answers."""
+    canonical = json.dumps(dict(payload), sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+
+
+def is_fictional_job(job: Mapping[str, Any]) -> bool:
+    """Return True if job originates from demo/fictional fixtures or example.com placeholder domains."""
+    origin = str(job.get('origin') or '').strip().lower()
+    if origin.startswith('fictional') or origin == 'demo':
+        return True
+    url = str(job.get('url') or '').strip()
+    if url:
+        host = (urlparse(url).hostname or '').lower().rstrip('.')
+        if host == 'example.com' or host.endswith('.example.com'):
+            return True
+    return False
+
+
+def extract_contact_hints(resume_text: str) -> dict[str, str]:
+    """Extract only explicitly visible contact signals from candidate resume text (never fabricates)."""
+    text = str(resume_text or '')
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    email_m = _EMAIL_RE.search(text)
+    phone_m = _PHONE_RE.search(text)
+    linkedin_m = _LINKEDIN_RE.search(text)
+    github_m = _GITHUB_RE.search(text)
+
+    full_name = ''
+    for line in lines[:5]:
+        low = line.lower().strip(':- ')
+        if low in _HEADING_SKIP or '@' in line or 'http' in low or '|' in line and len(line) > 55:
+            continue
+        if re.search(r'\d{3}', line):
+            continue
+        words = [w for w in re.split(r'\s+', line) if w]
+        if 1 <= len(words) <= 4 and len(line) <= 60:
+            full_name = line
+            break
+
+    return {
+        'full_name': full_name,
+        'email': email_m.group(0) if email_m else '',
+        'phone': phone_m.group(0) if phone_m else '',
+        'linkedin_url': linkedin_m.group(0) if linkedin_m else '',
+        'github_url': github_m.group(0) if github_m else '',
+    }
+
+
+def _extract_experience_lines(resume_text: str, limit: int = 8) -> str:
+    lines = [line.strip() for line in str(resume_text or '').splitlines() if line.strip()]
+    bullet_or_role = [
+        line for line in lines
+        if re.search(r'(20\d{2}|19\d{2})', line) or line.startswith(('-', '*', '•'))
+    ]
+    chosen = bullet_or_role[:limit] if bullet_or_role else lines[1:limit + 1]
+    return '\n'.join(chosen)[:2000]
+
+
+class CoPilotApplicationAdapter(ApplicationAdapter):
+    """D3 Human-Assist Co-Pilot Packet builder, Sensitive-Field Gate, and SHA-256 Receipt recorder."""
+
+    def __init__(self, config: Optional[dict[str, Any]] = None):
+        self._config = dict(config) if config is not None else load_pipeline_config()
+
+    @classmethod
+    def inspect_capabilities(cls, config: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+        """Report Co-Pilot adapter capabilities cleanly."""
+        cfg = dict(config) if config is not None else load_pipeline_config()
+        return {
+            'supported_portals': sorted(set(_PORTAL_SECTION_FLOWS.keys()) | {'linkedin', 'indeed', 'company_site', 'unknown'}),
+            'sensitive_fields_locked': list(SENSITIVE_FIELDS),
+            'requires_explicit_approval': True,
+            'playwright_hitl_enabled': bool(cfg.get('enable_playwright_hitl', False)),
+        }
+
+    def prepare(
+        self,
+        job: dict[str, Any],
+        profile: dict[str, Any],
+        approved_resume: str,
+    ) -> CoPilotPacket:
+        """Stage ordered portal copy-paste sections and lock sensitive fields for explicit candidate input."""
+        if not isinstance(job, Mapping):
+            raise ApplicationError('Job dict is required to prepare CoPilotPacket.')
+
+        resume_text = str(approved_resume or profile.get('resume') or '').strip()
+        if len(resume_text) < 50:
+            raise ApplicationError('Approved resume must contain at least 50 characters.')
+
+        url = str(job.get('url') or '').strip()
+        ats_family = str(job.get('ats_family') or '').strip().lower()
+        if not ats_family or ats_family == 'unknown':
+            ats_family = engine.detect_ats_family(url)
+
+        saved_answers = profile.get('candidate_answers') if isinstance(profile.get('candidate_answers'), Mapping) else {}
+        saved_sensitive = profile.get('sensitive_answers') if isinstance(profile.get('sensitive_answers'), Mapping) else {}
+        hints = extract_contact_hints(resume_text)
+        fit = engine.match_resume(resume_text, str(job.get('description') or ''))
+        shared_terms = fit.get('shared_keywords') or []
+
+        section_map: dict[str, dict[str, Any]] = {
+            'portal_preflight': {
+                'section_id': 'portal_preflight',
+                'title': '1. Workday Account & Portal Reminder',
+                'locked': False,
+                'fields': [
+                    {
+                        'key': 'portal_account_note',
+                        'label': 'Portal Sign-In Instruction',
+                        'value': f'Open {url or "target portal"} in your own browser, sign in manually, and review every screen.',
+                        'source': 'portal_guidance',
+                    },
+                ],
+            },
+            'contact_info': {
+                'section_id': 'contact_info',
+                'title': 'Candidate Contact Info (Verify Before Pasting)',
+                'locked': False,
+                'fields': [
+                    {'key': 'full_name', 'label': 'Full Name', 'value': str(saved_answers.get('full_name') or hints['full_name']), 'source': 'resume_hint_or_candidate'},
+                    {'key': 'email', 'label': 'Email', 'value': str(saved_answers.get('email') or hints['email']), 'source': 'resume_hint_or_candidate'},
+                    {'key': 'phone', 'label': 'Phone', 'value': str(saved_answers.get('phone') or hints['phone']), 'source': 'resume_hint_or_candidate'},
+                    {'key': 'location', 'label': 'Location', 'value': str(saved_answers.get('location') or ''), 'source': 'candidate_input'},
+                ],
+            },
+            'resume_and_links': {
+                'section_id': 'resume_and_links',
+                'title': 'Resume Text & Public Profile Links',
+                'locked': False,
+                'fields': [
+                    {'key': 'approved_resume_text', 'label': 'Approved Tailored Resume', 'value': resume_text, 'source': 'approved_resume'},
+                    {'key': 'linkedin_url', 'label': 'LinkedIn URL', 'value': str(saved_answers.get('linkedin_url') or hints['linkedin_url']), 'source': 'resume_hint_or_candidate'},
+                    {'key': 'github_url', 'label': 'GitHub / Portfolio URL', 'value': str(saved_answers.get('github_url') or hints['github_url']), 'source': 'resume_hint_or_candidate'},
+                    {'key': 'cover_note', 'label': 'Short Intro / Cover Note (Optional)', 'value': str(saved_answers.get('cover_note') or ''), 'source': 'candidate_input'},
+                ],
+            },
+            'work_history': {
+                'section_id': 'work_history',
+                'title': 'Verified Experience Highlights (From Resume)',
+                'locked': False,
+                'fields': [
+                    {'key': 'experience_highlights', 'label': 'Dated Roles / Bullets for Portal Fields', 'value': _extract_experience_lines(resume_text), 'source': 'approved_resume'},
+                    {'key': 'matched_skills', 'label': 'Verified JD Skill Overlap', 'value': ', '.join(shared_terms[:12]), 'source': 'match_resume'},
+                ],
+            },
+            'custom_questions': {
+                'section_id': 'custom_questions',
+                'title': 'Role-Specific Application Questions',
+                'locked': False,
+                'fields': [
+                    {
+                        'key': 'why_company_and_role',
+                        'label': f'Why {job.get("company") or "this company"} / {job.get("title") or "this role"}?',
+                        'value': str(saved_answers.get('why_company_and_role') or ''),
+                        'source': 'candidate_input',
+                    },
+                    {
+                        'key': 'additional_answers',
+                        'label': 'Other Portal Question Answers',
+                        'value': str(saved_answers.get('additional_answers') or ''),
+                        'source': 'candidate_input',
+                    },
+                ],
+            },
+            'sensitive_eligibility_locked': {
+                'section_id': 'sensitive_eligibility_locked',
+                'title': 'LOCKED Sensitive Eligibility & EEO Fields (Candidate Input Only)',
+                'locked': True,
+                'ai_generated': False,
+                'fields': [
+                    {
+                        'key': field_key,
+                        'label': _SENSITIVE_FIELD_PROMPTS[field_key][0],
+                        'placeholder': _SENSITIVE_FIELD_PROMPTS[field_key][1],
+                        'value': str(saved_sensitive.get(field_key) or ''),
+                        'locked': True,
+                        'ai_generated': False,
+                    }
+                    for field_key in SENSITIVE_FIELDS
+                ],
+            },
+        }
+
+        flow = _PORTAL_SECTION_FLOWS.get(ats_family, _DEFAULT_PORTAL_FLOW)
+        ordered_sections = [section_map[section_key] for section_key in flow]
+
+        overlap_note = (
+            f"Candidate resume aligns on {', '.join(shared_terms[:6])}."
+            if shared_terms
+            else 'Candidate manually reviewed alignment with the role requirements.'
+        )
+        callback_packet = {
+            'job_title': str(job.get('title') or ''),
+            'company': str(job.get('company') or ''),
+            'job_url': url,
+            'ats_family': ats_family,
+            'why_this_role': str(saved_answers.get('why_company_and_role') or overlap_note),
+            'submitted_answers': dict(saved_answers),
+            'shared_keywords': shared_terms[:12],
+            'probe_questions': [],
+        }
+
+        return CoPilotPacket(
+            job_id=int(job.get('id') or 0),
+            ats_family=ats_family,
+            ordered_sections=ordered_sections,
+            sensitive_fields_locked=list(SENSITIVE_FIELDS),
+            callback_packet=callback_packet,
+        )
+
+    def submit(self, prepared_application: dict[str, Any], explicit_user_approval: bool) -> ActionResult:
+        """Validate explicit approval, sensitive-field confirmation, and external evidence before receipt."""
+        if not explicit_user_approval:
+            raise PermissionError('Cannot submit without candidate approval.')
+        if not isinstance(prepared_application, Mapping):
+            raise ApplicationError('prepared_application must be a dict.')
+
+        job = prepared_application.get('job') if isinstance(prepared_application.get('job'), Mapping) else {}
+        approved_resume = str(
+            prepared_application.get('approved_resume')
+            or prepared_application.get('tailored_resume')
+            or ''
+        ).strip()
+        if len(approved_resume) < 50:
+            raise ApplicationError('Approved resume must contain at least 50 characters.')
+
+        outcome = str(prepared_application.get('outcome') or 'confirmed').strip().lower()
+        if outcome not in _COPILOT_VALID_OUTCOMES:
+            raise ApplicationError(f'Invalid outcome {outcome!r}. Allowed: {_COPILOT_VALID_OUTCOMES}.')
+
+        if outcome == 'confirmed' and is_fictional_job(job):
+            raise ApplicationError(
+                'Fictional demo jobs cannot be recorded as confirmed real applications. '
+                'Use Test Submit (not real) for demos, or import/discover a real public posting.'
+            )
+
+        sensitive_confirmed = bool(prepared_application.get('sensitive_fields_confirmed', False))
+        if not sensitive_confirmed:
+            raise ApplicationError(
+                'Sensitive eligibility fields are locked. Explicitly confirm candidate-entered values '
+                '(sensitive_fields_confirmed=True) before recording a submission.'
+            )
+
+        sensitive_answers = prepared_application.get('sensitive_answers')
+        if not isinstance(sensitive_answers, Mapping):
+            raise ApplicationError('sensitive_answers dictionary is required.')
+
+        normalized_sensitive: dict[str, str] = {}
+        for field_key in SENSITIVE_FIELDS:
+            if field_key not in sensitive_answers:
+                raise ApplicationError(
+                    f'Locked sensitive field {field_key!r} is missing. Candidate must provide a value or explicit decline.'
+                )
+            val = str(sensitive_answers.get(field_key) or '').strip()
+            if field_key in _REQUIRED_SENSITIVE_FIELDS and val.lower() in _DISALLOWED_PLACEHOLDERS:
+                raise ApplicationError(
+                    f'Sensitive field {field_key!r} requires a real candidate-confirmed answer (cannot be blank or placeholder).'
+                )
+            normalized_sensitive[field_key] = val
+
+        confirmation_reference = str(prepared_application.get('confirmation_reference') or '').strip()
+        if outcome == 'confirmed' and len(confirmation_reference) < 3:
+            raise ApplicationError(
+                'Real confirmation requires external confirmation_reference (ATS confirmation ID, confirmation email ID, or receipt reference). '
+                'Record manual_required or unknown instead when confirmation is unavailable.'
+            )
+
+        candidate_answers = prepared_application.get('candidate_answers')
+        clean_answers = dict(candidate_answers) if isinstance(candidate_answers, Mapping) else {}
+
+        resume_sha256 = compute_sha256_text(approved_resume)
+        answers_sha256 = compute_answers_sha256({
+            'job_url': str(job.get('url') or '').strip(),
+            'candidate_answers': clean_answers,
+            'sensitive_answers': normalized_sensitive,
+        })
+        evidence_path = str(prepared_application.get('evidence_path') or '').strip() or None
+        evidence_note = str(prepared_application.get('evidence_note') or '').strip()
+        submitted_at = datetime.now(timezone.utc).isoformat()
+
+        if outcome == 'confirmed':
+            details = f'Confirmed real submission ({confirmation_reference}) recorded at {submitted_at}.'
+            if evidence_note:
+                details = f'{details} Note: {evidence_note}'
+            return ActionResult(
+                status='confirmed',
+                confirmation_id=confirmation_reference,
+                details=details,
+                resume_sha256=resume_sha256,
+                answers_sha256=answers_sha256,
+                evidence_path=evidence_path,
+            )
+
+        details = evidence_note or f'Application paused/not confirmed (status={outcome}) at {submitted_at}.'
+        return ActionResult(
+            status=outcome,
+            confirmation_id=None,
+            details=details,
+            resume_sha256=resume_sha256,
+            answers_sha256=answers_sha256,
+            evidence_path=evidence_path,
+        )
+
 

@@ -925,5 +925,285 @@ class JobDiscoveryAndRoutesTests(unittest.TestCase):
         self.assertEqual(code_501, 501)
 
 
+from app.adapters_pipeline import (
+    ApplicationError,
+    CoPilotApplicationAdapter,
+    SENSITIVE_FIELDS,
+    compute_answers_sha256,
+    compute_sha256_text,
+    extract_contact_hints,
+    is_fictional_job,
+)
+
+
+class CoPilotApplicationAndReceiptTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._db_path = Path(self._tmp.name) / 'test_copilot.sqlite3'
+        self._patch = mock.patch.object(db, 'DB_PATH', self._db_path)
+        self._patch.start()
+        db.init_db()
+
+    def tearDown(self):
+        self._patch.stop()
+        self._tmp.cleanup()
+
+    def _valid_sensitive_answers(self):
+        return {
+            'work_authorization': 'Authorized to work in the US without sponsorship',
+            'visa_sponsorship': 'No',
+            'salary_expectation': 'Negotiable ($140k-$165k)',
+            'veteran_status': 'Decline to self-identify',
+            'disability_status': 'Decline to self-identify',
+            'references': 'Available upon request',
+        }
+
+    def test_copilot_packet_ordering_conservative_hints_and_sensitive_locks(self):
+        resume_with_contact = (
+            'Jordan Taylor\n'
+            'jordan.taylor@example.org | (512) 555-0199\n'
+            'https://linkedin.com/in/jordantaylor | https://github.com/jordantaylor\n'
+            '- 2023-2026: Built Python and SQL cloud APIs at Northwind Systems.'
+        )
+        adapter = CoPilotApplicationAdapter()
+        workday_packet = adapter.prepare(
+            {
+                'id': 10,
+                'title': 'Platform Engineer',
+                'company': 'Contoso',
+                'description': 'Build reliable Python microservices and SQL data pipelines.',
+                'url': 'https://contoso.wd5.myworkdayjobs.com/en-US/Careers/job/R99',
+            },
+            {'resume': resume_with_contact},
+            resume_with_contact,
+        )
+        self.assertEqual(workday_packet.ats_family, 'workday')
+        section_ids = [s['section_id'] for s in workday_packet.ordered_sections]
+        self.assertEqual(section_ids[0], 'portal_preflight')
+        self.assertEqual(section_ids[-1], 'sensitive_eligibility_locked')
+
+        locked_sec = workday_packet.ordered_sections[-1]
+        self.assertTrue(locked_sec['locked'])
+        self.assertFalse(locked_sec['ai_generated'])
+        self.assertEqual([f['key'] for f in locked_sec['fields']], list(SENSITIVE_FIELDS))
+        self.assertTrue(all(f['value'] == '' for f in locked_sec['fields']))
+
+        # No invented contact details when absent from resume
+        minimal_hints = extract_contact_hints('Experienced engineer delivering scalable APIs.')
+        self.assertEqual(minimal_hints['email'], '')
+        self.assertEqual(minimal_hints['phone'], '')
+        self.assertEqual(minimal_hints['linkedin_url'], '')
+
+    def test_adapter_consent_sensitive_fictional_and_evidence_gates(self):
+        adapter = CoPilotApplicationAdapter()
+        resume = 'Alex Rivera - Senior Backend Engineer with 6 years building Python APIs and SQL systems.'
+        real_job = {
+            'id': 20,
+            'title': 'Senior Backend Engineer',
+            'company': 'Acme Cloud',
+            'origin': 'imported_url',
+            'url': 'https://boards.greenhouse.io/acme/jobs/777',
+        }
+        base_payload = {
+            'job': real_job,
+            'approved_resume': resume,
+            'candidate_answers': {'full_name': 'Alex Rivera', 'why_company_and_role': 'Excited about distributed systems.'},
+            'sensitive_answers': self._valid_sensitive_answers(),
+            'sensitive_fields_confirmed': True,
+            'outcome': 'confirmed',
+            'confirmation_reference': 'GH-94821-CONF',
+        }
+
+        with self.assertRaises(PermissionError):
+            adapter.submit(base_payload, explicit_user_approval=False)
+
+        with self.assertRaises(ApplicationError):
+            adapter.submit({**base_payload, 'sensitive_fields_confirmed': False}, explicit_user_approval=True)
+
+        bad_sens = dict(self._valid_sensitive_answers())
+        bad_sens['work_authorization'] = 'TBD'
+        with self.assertRaises(ApplicationError):
+            adapter.submit({**base_payload, 'sensitive_answers': bad_sens}, explicit_user_approval=True)
+
+        with self.assertRaises(ApplicationError):
+            adapter.submit({**base_payload, 'confirmation_reference': ''}, explicit_user_approval=True)
+
+        self.assertTrue(is_fictional_job({'origin': 'fictional-sample', 'url': 'https://example.com/jobs/1'}))
+        with self.assertRaises(ApplicationError):
+            adapter.submit(
+                {**base_payload, 'job': {'origin': 'fictional-sample', 'url': 'https://example.com/jobs/1'}},
+                explicit_user_approval=True,
+            )
+
+        manual_res = adapter.submit(
+            {**base_payload, 'outcome': 'manual_required', 'confirmation_reference': ''},
+            explicit_user_approval=True,
+        )
+        self.assertEqual(manual_res.status, 'manual_required')
+        self.assertIsNone(manual_res.confirmation_id)
+
+        ok_res = adapter.submit(base_payload, explicit_user_approval=True)
+        self.assertEqual(ok_res.status, 'confirmed')
+        self.assertEqual(ok_res.confirmation_id, 'GH-94821-CONF')
+        self.assertEqual(ok_res.resume_sha256, compute_sha256_text(resume))
+        self.assertEqual(len(ok_res.answers_sha256), 64)
+
+    def test_copilot_routes_receipts_duplicate_block_and_test_isolation(self):
+        # Status reports A-03
+        code_status, body_status = routes_pipeline.handle_get('/api/pipeline/status')
+        self.assertEqual(code_status, 200)
+        self.assertIn('A-03', body_status['tasks_completed'])
+        self.assertIn('application_adapter', body_status)
+
+        # Insert 2 real jobs pointing to same canonical URL (tracking param difference) + 1 real job for test_submitted check
+        with db.connection() as con:
+            j1_id = con.execute(
+                'INSERT INTO jobs(title, company, description, url, origin, ats_family) VALUES(?,?,?,?,?,?)',
+                (
+                    'Solutions Engineer',
+                    'Acme Cloud',
+                    'Architect Python REST integrations and cloud deployments.',
+                    'https://boards.greenhouse.io/acme/jobs/501',
+                    'imported_url',
+                    'greenhouse',
+                ),
+            ).lastrowid
+            j2_id = con.execute(
+                'INSERT INTO jobs(title, company, description, url, origin, ats_family) VALUES(?,?,?,?,?,?)',
+                (
+                    'Solutions Engineer (Mirror Link)',
+                    'Acme Cloud',
+                    'Architect Python REST integrations and cloud deployments.',
+                    'https://boards.greenhouse.io/acme/jobs/501?utm_source=linkedin',
+                    'discovered',
+                    'greenhouse',
+                ),
+            ).lastrowid
+            j3_id = con.execute(
+                'INSERT INTO jobs(title, company, description, url, origin, ats_family) VALUES(?,?,?,?,?,?)',
+                (
+                    'Customer Success Engineer',
+                    'Beta Corp',
+                    'Support enterprise API onboarding with Python and SQL.',
+                    'https://jobs.lever.co/beta/999',
+                    'imported_url',
+                    'lever',
+                ),
+            ).lastrowid
+
+        # Build Co-Pilot Packet directly for job 1
+        code_cp1, body_cp1 = routes_pipeline.handle_post(f'/api/pipeline/jobs/{j1_id}/copilot', {})
+        self.assertEqual(code_cp1, 200)
+        app1_id = body_cp1['application']['id']
+        self.assertEqual(body_cp1['copilot_packet']['ats_family'], 'greenhouse')
+
+        # Confirmation without explicit approval -> 403
+        code_403, _ = routes_pipeline.handle_post(
+            f'/api/pipeline/applications/{app1_id}/confirm',
+            {
+                'explicit_user_approval': False,
+                'sensitive_fields_confirmed': True,
+                'sensitive_answers': self._valid_sensitive_answers(),
+                'outcome': 'confirmed',
+                'confirmation_reference': 'GH-501',
+            },
+        )
+        self.assertEqual(code_403, 403)
+
+        # Fictional demo job #1 supports Co-Pilot preview but rejects real confirmed submission
+        code_demo_cp, body_demo_cp = routes_pipeline.handle_post('/api/pipeline/jobs/1/copilot', {})
+        self.assertEqual(code_demo_cp, 200)
+        code_demo_confirm, _ = routes_pipeline.handle_post(
+            f'/api/pipeline/applications/{body_demo_cp["application"]["id"]}/confirm',
+            {
+                'explicit_user_approval': True,
+                'sensitive_fields_confirmed': True,
+                'sensitive_answers': self._valid_sensitive_answers(),
+                'outcome': 'confirmed',
+                'confirmation_reference': 'FAKE-123',
+            },
+        )
+        self.assertEqual(code_demo_confirm, 400)
+
+        # Manual required preserves empty confirmation -> real_submitted count remains 0
+        code_man, body_man = routes_pipeline.handle_post(
+            f'/api/pipeline/applications/{app1_id}/confirm',
+            {
+                'explicit_user_approval': True,
+                'sensitive_fields_confirmed': True,
+                'sensitive_answers': self._valid_sensitive_answers(),
+                'outcome': 'manual_required',
+                'evidence_note': 'CAPTCHA challenge on portal; paused honestly.',
+            },
+        )
+        self.assertEqual(code_man, 200)
+        self.assertFalse(body_man['real_submitted_counted'])
+        self.assertEqual(
+            db.row("SELECT COUNT(*) AS n FROM applications WHERE status='confirmed' AND confirmation!=''")['n'],
+            0,
+        )
+
+        # Valid confirmation increments real_submitted to 1 and populates SHA-256 receipt
+        code_ok, body_ok = routes_pipeline.handle_post(
+            f'/api/pipeline/applications/{app1_id}/confirm',
+            {
+                'explicit_user_approval': True,
+                'sensitive_fields_confirmed': True,
+                'candidate_answers': {'full_name': 'Alex Rivera', 'why_company_and_role': 'Direct fit on REST APIs.'},
+                'sensitive_answers': self._valid_sensitive_answers(),
+                'outcome': 'confirmed',
+                'confirmation_reference': 'GH-CONF-501-XYZ',
+                'evidence_note': 'Received confirmation email.',
+                'evidence_path': 'screenshots/gh_501.png',
+            },
+        )
+        self.assertEqual(code_ok, 200)
+        self.assertTrue(body_ok['real_submitted_counted'])
+        self.assertEqual(body_ok['receipt']['confirmation_reference'], 'GH-CONF-501-XYZ')
+        self.assertEqual(
+            db.row("SELECT COUNT(*) AS n FROM applications WHERE status='confirmed' AND confirmation!=''")['n'],
+            1,
+        )
+
+        # Duplicate confirmed application via normalized mirror URL (j2_id) is blocked with 409
+        _, body_cp2 = routes_pipeline.handle_post(f'/api/pipeline/jobs/{j2_id}/copilot', {})
+        app2_id = body_cp2['application']['id']
+        code_dup, _ = routes_pipeline.handle_post(
+            f'/api/pipeline/applications/{app2_id}/confirm',
+            {
+                'explicit_user_approval': True,
+                'sensitive_fields_confirmed': True,
+                'sensitive_answers': self._valid_sensitive_answers(),
+                'outcome': 'confirmed',
+                'confirmation_reference': 'GH-CONF-501-DUP',
+            },
+        )
+        self.assertEqual(code_dup, 409)
+
+        # test_submitted application stays isolated and cannot be promoted to confirmed
+        with db.connection() as con:
+            app3_id = con.execute(
+                "INSERT INTO applications(job_id, tailored_resume, fit_score, status, confirmation) VALUES(?,?,?,'test_submitted',?)",
+                (j3_id, 'A' * 80, 75, 'DEMO ONLY - no job site contacted'),
+            ).lastrowid
+        code_iso, _ = routes_pipeline.handle_post(
+            f'/api/pipeline/applications/{app3_id}/confirm',
+            {
+                'explicit_user_approval': True,
+                'sensitive_fields_confirmed': True,
+                'sensitive_answers': self._valid_sensitive_answers(),
+                'outcome': 'confirmed',
+                'confirmation_reference': 'LEVER-999',
+            },
+        )
+        self.assertEqual(code_iso, 400)
+
+        # Audit log never stores raw sensitive answers (like $140k-$165k salary expectation)
+        audits = db.rows("SELECT details_json FROM audit_events WHERE action='application_confirmed'")
+        self.assertEqual(len(audits), 1)
+        self.assertNotIn('$140k-$165k', audits[0]['details_json'])
+        self.assertIn('GH-CONF-501-XYZ', audits[0]['details_json'])
+
+
 if __name__ == '__main__':
     unittest.main()
