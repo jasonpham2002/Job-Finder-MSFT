@@ -221,6 +221,26 @@
       <div id="pipelineTailorStatus" class="muted" style="margin-top:6px;">Select a job, then run Anti-Slop Tailor to verify every claim against your resume and preview clean OOXML text.</div>
       <div id="pipelineTailorWorkspace" style="margin-top:10px;"></div>
     </div>
+    <div style="border-top:1px solid #d9e1ea;padding-top:10px;margin-top:12px;">
+      <div style="display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:8px;">
+        <div>
+          <strong>D5 Gap-to-Proof Bridge &amp; D2 Callback Cheat Sheet (A-05)</strong>
+          <span id="pipelineGapBadge"></span>
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;">
+          <select id="pipelineGapMode" aria-label="Gap analysis mode" style="width:auto;min-width:170px;">
+            <option value="auto">Mode: Auto (LLM if configured)</option>
+            <option value="llm">Mode: LLM Only</option>
+            <option value="heuristic">Mode: Deterministic Offline</option>
+          </select>
+          <button id="pipelineAnalyzeGapsBtn" type="button">Analyze Skill Gaps (Selected Job)</button>
+          <button id="pipelineRefreshCallbackBtn" type="button" class="secondary">Refresh Callback Cheat Sheet</button>
+        </div>
+      </div>
+      <div id="pipelineGapStatus" class="muted" style="margin-top:6px;">Classify wording gaps vs. true skill gaps (blocked until a public proof URL is verified) and preview your 30-second interview callback sheet.</div>
+      <div id="pipelineGapWorkspace" style="margin-top:10px;"></div>
+      <div id="pipelineCallbackWorkspace" style="margin-top:10px;"></div>
+    </div>
   `;
 
   const statusPill = document.getElementById('pipelineStatusPill');
@@ -278,11 +298,184 @@
   const exportDocxBtn = document.getElementById('pipelineExportDocxBtn');
   const tailorStatusEl = document.getElementById('pipelineTailorStatus');
   const tailorWorkspaceEl = document.getElementById('pipelineTailorWorkspace');
+  const gapModeEl = document.getElementById('pipelineGapMode');
+  const analyzeGapsBtn = document.getElementById('pipelineAnalyzeGapsBtn');
+  const refreshCallbackBtn = document.getElementById('pipelineRefreshCallbackBtn');
+  const gapBadgeEl = document.getElementById('pipelineGapBadge');
+  const gapStatusEl = document.getElementById('pipelineGapStatus');
+  const gapWorkspaceEl = document.getElementById('pipelineGapWorkspace');
+  const callbackWorkspaceEl = document.getElementById('pipelineCallbackWorkspace');
 
   let pendingFallbackUrl = '';
   let activeCopilotAppId = null;
   let activeTailorAppId = null;
   let lastTailorReport = null;
+
+  function renderGapReport(data) {
+    if (!gapWorkspaceEl) return;
+    if (!data) {
+      if (gapBadgeEl) gapBadgeEl.innerHTML = '';
+      gapWorkspaceEl.innerHTML = '<div class="small muted">Select a job and click "Analyze Skill Gaps" to classify wording gaps vs. unverified skills needing a 48h micro-project proof URL.</div>';
+      return;
+    }
+    const wording = Array.isArray(data.wording_gaps) ? data.wording_gaps : [];
+    const skills = Array.isArray(data.skill_gaps) ? data.skill_gaps : [];
+    const verifiedCount = skills.filter((s) => Boolean(s.verified)).length;
+    if (gapBadgeEl) {
+      gapBadgeEl.innerHTML = badgeHtml(`Wording: ${wording.length}`, 'neutral')
+        + badgeHtml(`Skill Gaps: ${skills.length}`, skills.length ? 'warn' : 'good')
+        + badgeHtml(`Verified Proofs: ${verifiedCount}`, verifiedCount ? 'good' : 'neutral');
+    }
+
+    const wordingHtml = wording.length
+      ? wording.map((w) => `
+          <div style="border:1px solid #d5eadc;background:#f4fbf6;padding:6px 8px;border-radius:6px;margin-bottom:6px;">
+            <div class="small"><strong>Job Term:</strong> ${esc(w.job_term)}</div>
+            <div class="small muted"><strong>Candidate Evidence:</strong> ${esc(w.candidate_evidence)}</div>
+          </div>
+        `).join('')
+      : '<div class="small muted">No synonym/wording gaps detected for this role.</div>';
+
+    const skillsHtml = skills.length
+      ? skills.map((s) => {
+          const isVerified = Boolean(s.verified);
+          const safeUrl = s.proof_url && /^https?:\/\//i.test(String(s.proof_url)) ? String(s.proof_url) : '';
+          const statusChip = isVerified
+            ? badgeHtml('Verified & Unlocked for Tailor', 'good')
+            : badgeHtml('Blocked Until Verified', 'bad');
+          const proofDisplay = safeUrl
+            ? `<div class="small" style="margin-top:4px;"><strong>Verified Proof:</strong> <a href="${esc(safeUrl)}" target="_blank" rel="noopener noreferrer">${esc(safeUrl)}</a></div>`
+            : '';
+          const verifyControls = s.id
+            ? `
+              <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px;">
+                <input id="pipelineProofUrl_${Number(s.id)}" type="url" value="${esc(safeUrl)}" placeholder="https://github.com/you/micro-proof" style="flex:1;min-width:190px;" />
+                <button type="button" data-verify-gap-id="${Number(s.id)}" class="${isVerified ? 'secondary' : ''}">${isVerified ? 'Update Proof URL' : 'Verify Proof & Unlock'}</button>
+              </div>
+            `
+            : '';
+          return `
+            <div style="border:1px solid ${isVerified ? '#b7e1c4' : '#f1c7c2'};background:${isVerified ? '#f4fbf6' : '#fff8f7'};padding:6px 8px;border-radius:6px;margin-bottom:6px;">
+              <div style="display:flex;justify-content:space-between;align-items:center;gap:6px;flex-wrap:wrap;">
+                <strong>${esc(s.skill_name)}</strong>
+                ${statusChip}
+              </div>
+              <div class="small" style="margin-top:4px;"><strong>48h Micro-Project Brief:</strong> ${esc(s.micro_project_brief)}</div>
+              ${proofDisplay}
+              ${verifyControls}
+            </div>
+          `;
+        }).join('')
+      : '<div class="small muted">No missing true skills detected against current job keywords.</div>';
+
+    gapWorkspaceEl.innerHTML = `
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+        <div style="border:1px solid #d9e1ea;border-radius:8px;padding:8px;background:#fff;">
+          <div style="font-weight:600;margin-bottom:6px;">Wording Gaps (Rephrasing OK) (${wording.length})</div>
+          ${wordingHtml}
+        </div>
+        <div style="border:1px solid #d9e1ea;border-radius:8px;padding:8px;background:#fff;">
+          <div style="font-weight:600;margin-bottom:6px;">True Skill Gaps (Blocked Without Public Proof) (${skills.length})</div>
+          ${skillsHtml}
+        </div>
+      </div>
+    `;
+  }
+
+  function renderCallbackCheatSheet(appId, cb, isImmutable) {
+    if (!callbackWorkspaceEl) return;
+    if (!cb || typeof cb !== 'object' || Object.keys(cb).length === 0) {
+      callbackWorkspaceEl.innerHTML = '<div class="small muted">Prepare Anti-Slop Tailor, Co-Pilot, or click "Refresh Callback Cheat Sheet" to generate a 30-second recruiter callback brief.</div>';
+      return;
+    }
+    const diffs = Array.isArray(cb.diff_summary) ? cb.diff_summary : [];
+    const answers = (cb.submitted_answers && typeof cb.submitted_answers === 'object') ? cb.submitted_answers : {};
+    const answerEntries = Object.entries(answers).filter(([, val]) => val !== null && val !== undefined && String(val).trim() !== '');
+    const proofs = Array.isArray(cb.verified_gap_proofs) ? cb.verified_gap_proofs : [];
+    const probes = Array.isArray(cb.probe_questions) ? cb.probe_questions : [];
+
+    const diffHtml = diffs.length
+      ? diffs.map((d) => `<li class="small"><strong>${esc(d.change_type || 'edit')}:</strong> ${esc(d.summary || d.edited || d.original)}</li>`).join('')
+      : '<li class="small muted">Matches master resume baseline cleanly.</li>';
+
+    const answersHtml = answerEntries.length
+      ? answerEntries.map(([k, v]) => `<div class="small"><strong>${esc(k)}:</strong> ${esc(String(v))}</div>`).join('')
+      : '<div class="small muted">No candidate application answers saved yet.</div>';
+
+    const proofsHtml = proofs.length
+      ? proofs.map((p) => {
+          const safeUrl = p.proof_url && /^https?:\/\//i.test(String(p.proof_url)) ? String(p.proof_url) : '';
+          const link = safeUrl
+            ? ` — <a href="${esc(safeUrl)}" target="_blank" rel="noopener noreferrer">${esc(safeUrl)}</a>`
+            : '';
+          return `<li class="small"><strong>${esc(p.skill_name)}</strong>${link}</li>`;
+        }).join('')
+      : '<li class="small muted">No verified gap proofs attached for this role yet.</li>';
+
+    const probesHtml = probes.length
+      ? probes.map((q) => `<li class="small">${esc(q)}</li>`).join('')
+      : '<li class="small muted">Run Refresh Callback Cheat Sheet to generate 3 interviewer probe questions.</li>';
+
+    const metaBadges = [
+      appId ? badgeHtml(`App #${appId}`, 'neutral') : '',
+      isImmutable ? badgeHtml('Confirmed Receipt (Immutable)', 'good') : '',
+      cb.confirmation_reference ? badgeHtml(`Ref: ${cb.confirmation_reference}`, 'good') : '',
+      cb.callback_generation_mode ? badgeHtml(`Callback: ${cb.callback_generation_mode}`, 'neutral') : '',
+    ].join('');
+
+    callbackWorkspaceEl.innerHTML = `
+      <div style="border:1px solid #d9e1ea;border-radius:8px;padding:10px;background:#fff;">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px;">
+          <strong>D2 30-Second Callback Cheat Sheet Snapshot</strong>
+          <div>${metaBadges}</div>
+        </div>
+        <div class="small" style="margin-bottom:6px;"><strong>Why This Role:</strong> ${esc(cb.why_this_role || 'Tailor or build Co-Pilot packet to populate role pitch.')}</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:6px;">
+          <div style="border:1px solid #e6ecf2;border-radius:6px;padding:6px 8px;background:#fafcff;">
+            <div class="small" style="font-weight:600;margin-bottom:4px;">Master -&gt; Tailored Diff Summary (${diffs.length})</div>
+            <ul style="margin:0 0 0 16px;padding:0;">${diffHtml}</ul>
+          </div>
+          <div style="border:1px solid #e6ecf2;border-radius:6px;padding:6px 8px;background:#fafcff;">
+            <div class="small" style="font-weight:600;margin-bottom:4px;">Submitted Application Answers</div>
+            ${answersHtml}
+          </div>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px;">
+          <div style="border:1px solid #e6ecf2;border-radius:6px;padding:6px 8px;background:#fafcff;">
+            <div class="small" style="font-weight:600;margin-bottom:4px;">Verified Gap Proofs (${proofs.length})</div>
+            <ul style="margin:0 0 0 16px;padding:0;">${proofsHtml}</ul>
+          </div>
+          <div style="border:1px solid #e6ecf2;border-radius:6px;padding:6px 8px;background:#fafcff;">
+            <div class="small" style="font-weight:600;margin-bottom:4px;">3 Likely Interviewer Probe Questions</div>
+            <ol style="margin:0 0 0 16px;padding:0;">${probesHtml}</ol>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  async function renderGapBoardForSelectedJob() {
+    if (!gapWorkspaceEl) return;
+    if (typeof chosen === 'undefined' || !chosen || !chosen.id) {
+      renderGapReport(null);
+      return;
+    }
+    try {
+      const resp = await fetch(`/api/pipeline/jobs/${Number(chosen.id)}/gaps`);
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.error || 'Could not load gap analysis');
+      if (data.wording_gaps.length || data.skill_gaps.length) {
+        renderGapReport(data);
+        if (gapStatusEl) {
+          gapStatusEl.textContent = `Loaded ${data.wording_gaps.length} wording gaps and ${data.skill_gaps.length} true skill gaps (${data.verified_count} verified proofs unlocked).`;
+        }
+      } else {
+        renderGapReport(null);
+      }
+    } catch (_err) {
+      renderGapReport(null);
+    }
+  }
 
   function base64ToUint8Array(b64) {
     const binary = atob(b64);
@@ -413,9 +606,11 @@
   }
 
   async function syncTailorWorkspaceForSelectedJob() {
+    renderGapBoardForSelectedJob();
     if (!tailorWorkspaceEl) return;
     if (typeof chosen === 'undefined' || !chosen || !chosen.id) {
       activeTailorAppId = null;
+      renderCallbackCheatSheet(null, null, false);
       return;
     }
     try {
@@ -427,6 +622,7 @@
       if (!latest) {
         activeTailorAppId = null;
         renderTailorReport(null);
+        renderCallbackCheatSheet(null, null, false);
         return;
       }
       activeTailorAppId = latest.id;
@@ -456,6 +652,17 @@
       } else {
         renderTailorReport(null);
       }
+      if (Array.isArray(cb.probe_questions) && Array.isArray(cb.diff_summary)) {
+        renderCallbackCheatSheet(latest.id, cb, latest.status === 'confirmed');
+      } else {
+        const cbResp = await fetch(`/api/pipeline/applications/${Number(latest.id)}/callback-packet`);
+        const cbData = await cbResp.json();
+        if (cbResp.ok && cbData.callback_packet) {
+          renderCallbackCheatSheet(latest.id, cbData.callback_packet, Boolean(cbData.immutable));
+        } else {
+          renderCallbackCheatSheet(latest.id, cb, latest.status === 'confirmed');
+        }
+      }
     } catch (_err) {
       // Non-blocking UI sync
     }
@@ -469,12 +676,14 @@
       const m = data.model_adapter || {};
       const d = data.discovery_adapter || {};
       const a = data.application_adapter || {};
+      const g = data.gap_bridge_adapter || {};
       const llmLabel = m.configured
         ? `LLM: ${m.active_provider} (${m.active_model})`
         : 'LLM: offline';
       const serperLabel = d.serper_configured ? 'Serper: ready' : 'Serper: ATS-only';
       const copilotLabel = a.requires_explicit_approval ? 'D3 Co-Pilot: ready' : 'D3: pending';
-      statusPill.textContent = `${llmLabel} | ${serperLabel} | ${copilotLabel}`;
+      const gapLabel = g.implemented ? 'D5: ready' : 'D5: pending';
+      statusPill.textContent = `${llmLabel} | ${serperLabel} | ${copilotLabel} | ${gapLabel}`;
     } catch (_err) {
       statusPill.textContent = 'Pipeline status unavailable';
     }
@@ -769,6 +978,10 @@
     `;
     copilotWorkspace.style.display = 'block';
     copilotStatus.textContent = `Loaded D3 Co-Pilot Packet for App #${appObj.id}: ${appObj.title || ''} @ ${appObj.company || ''}.`;
+    const cbData = appObj.callback_packet || safeParseJson(appObj.callback_packet_json);
+    if (cbData) {
+      renderCallbackCheatSheet(appObj.id, cbData, appObj.status === 'confirmed');
+    }
   }
 
   async function renderReceiptLedger() {
@@ -920,6 +1133,13 @@
       if (result.application && result.application.copilot_packet) {
         renderCopilotPacket(result.application, result.application.copilot_packet);
       }
+      if (result.application && result.application.callback_packet) {
+        renderCallbackCheatSheet(
+          result.application.id,
+          result.application.callback_packet,
+          result.application.status === 'confirmed'
+        );
+      }
       const msg = result.real_submitted_counted
         ? `Confirmed real application receipt recorded (${result.receipt.confirmation_reference}).`
         : `Recorded status "${result.receipt.status}" (not counted as real confirmed submission).`;
@@ -965,6 +1185,13 @@
           tailorStatusEl.textContent = `Tailored via ${data.generation_mode} (Application #${activeTailorAppId || '?'}; ${data.claim_evidence_map.length} verified claims, ${data.slop_warnings.length} slop warnings).`;
         }
         renderTailorReport(data);
+        if (data.application && data.application.callback_packet) {
+          renderCallbackCheatSheet(
+            data.application.id,
+            data.application.callback_packet,
+            data.application.status === 'confirmed'
+          );
+        }
         showNotice('AI Anti-Slop Tailor completed with verified claim trace.');
         if (typeof reload === 'function') await reload();
         await renderReceiptLedger();
@@ -1056,6 +1283,96 @@
         showNotice(`DOCX export failed: ${err.message}`);
       } finally {
         exportDocxBtn.disabled = false;
+      }
+    });
+  }
+
+  if (analyzeGapsBtn) {
+    analyzeGapsBtn.addEventListener('click', async () => {
+      if (typeof chosen === 'undefined' || !chosen || !chosen.id) {
+        showNotice('Select a job from the list before analyzing skill gaps.');
+        return;
+      }
+      const mode = gapModeEl ? gapModeEl.value : 'auto';
+      if (gapStatusEl) {
+        gapStatusEl.textContent = `Running D5 Gap-to-Proof analysis (${mode}) for ${chosen.company} — ${chosen.title}...`;
+      }
+      analyzeGapsBtn.disabled = true;
+      try {
+        const data = await postJson('/api/pipeline/gaps/analyze', {
+          job_id: chosen.id,
+          mode,
+        });
+        renderGapReport(data);
+        if (gapStatusEl) {
+          gapStatusEl.textContent = `Analyzed via ${data.generation_mode}: ${data.wording_gaps.length} wording gaps, ${data.skill_gaps.length} true skill gaps (${data.verified_count} verified).`;
+        }
+        showNotice('D5 Gap-to-Proof analysis complete.');
+        await syncTailorWorkspaceForSelectedJob();
+      } catch (err) {
+        if (gapStatusEl) gapStatusEl.textContent = `Gap analysis error: ${err.message}`;
+        showNotice(`Gap analysis failed: ${err.message}`);
+      } finally {
+        analyzeGapsBtn.disabled = false;
+      }
+    });
+  }
+
+  if (gapWorkspaceEl) {
+    gapWorkspaceEl.addEventListener('click', async (evt) => {
+      const btn = evt.target && evt.target.closest ? evt.target.closest('[data-verify-gap-id]') : null;
+      if (!btn) return;
+      const gapId = Number(btn.getAttribute('data-verify-gap-id'));
+      const inputEl = document.getElementById(`pipelineProofUrl_${gapId}`);
+      const proofUrl = inputEl ? inputEl.value.trim() : '';
+      if (!proofUrl) {
+        showNotice('Enter a public https:// proof URL (e.g., GitHub repo or live demo) before verifying.');
+        return;
+      }
+      btn.disabled = true;
+      try {
+        const data = await postJson(`/api/pipeline/gaps/${gapId}/verify`, {
+          proof_url: proofUrl,
+        });
+        renderGapReport(data);
+        if (gapStatusEl) {
+          gapStatusEl.textContent = `Verified proof for "${data.unlocked_skill}"! Re-run AI Anti-Slop Tailor to include this verified project.`;
+        }
+        showNotice(`Unlocked skill "${data.unlocked_skill}" for tailoring and updated Callback Cheat Sheet.`);
+        await syncTailorWorkspaceForSelectedJob();
+      } catch (err) {
+        if (gapStatusEl) gapStatusEl.textContent = `Verification blocked: ${err.message}`;
+        showNotice(`Proof verification failed: ${err.message}`);
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  }
+
+  if (refreshCallbackBtn) {
+    refreshCallbackBtn.addEventListener('click', async () => {
+      const targetAppId = activeTailorAppId || activeCopilotAppId || (copilotAppSelect && copilotAppSelect.value ? Number(copilotAppSelect.value) : null);
+      if (!targetAppId) {
+        showNotice('Prepare Anti-Slop Tailor or Co-Pilot Packet for a job first to build its Callback Cheat Sheet.');
+        return;
+      }
+      const mode = gapModeEl ? gapModeEl.value : 'heuristic';
+      refreshCallbackBtn.disabled = true;
+      try {
+        const data = await postJson(`/api/pipeline/applications/${Number(targetAppId)}/callback-packet`, {
+          mode,
+          refresh_probes: true,
+        });
+        renderCallbackCheatSheet(targetAppId, data.callback_packet, Boolean(data.immutable));
+        showNotice(
+          data.immutable
+            ? `Loaded immutable Callback Cheat Sheet for confirmed application #${targetAppId}.`
+            : `Updated D2 Callback Cheat Sheet for application #${targetAppId}.`
+        );
+      } catch (err) {
+        showNotice(`Callback Cheat Sheet error: ${err.message}`);
+      } finally {
+        refreshCallbackBtn.disabled = false;
       }
     });
   }

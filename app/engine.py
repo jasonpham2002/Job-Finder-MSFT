@@ -7,6 +7,7 @@ text as untrusted data.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import difflib
 import html
 from html.parser import HTMLParser
 import ipaddress
@@ -966,4 +967,284 @@ def verify_tailor_grounding(
         'unverified_claims': list(dict.fromkeys(unverified_claims)),
         'questions_for_candidate': list(dict.fromkeys(questions)),
     }
+
+
+# ---------------------------------------------------------------------------
+# Task A-05: D5 Gap-to-Proof Bridge & D2 Callback Cheat Sheet Engine Helpers
+# ---------------------------------------------------------------------------
+
+_GENERIC_FILLER_GAP_WORDS = frozenset({
+    'analyze', 'analysis', 'backend', 'build', 'building', 'clean', 'collaborate', 'create', 'creating',
+    'data', 'deliver', 'deployment', 'deployments', 'design', 'develop', 'developing', 'drive', 'end', 'engineer',
+    'engineering', 'ensure', 'environment', 'fast', 'focus', 'frontend', 'fullstack', 'good', 'great', 'harnesses', 'help', 'high',
+    'implement', 'improve', 'including', 'key', 'large', 'maintain', 'manage', 'modern', 'module', 'modules', 'new',
+    'open', 'own', 'platform', 'problems', 'product', 'production', 'proven', 'real', 'related', 'reliable',
+    'remote', 'requirements', 'role', 'scalable', 'scale', 'services', 'software', 'solutions',
+    'stakeholder', 'stakeholders', 'support', 'supporting', 'system', 'systems', 'technical',
+    'tools', 'understand', 'writing', 'written',
+})
+
+_SKILL_SYNONYM_CLUSTERS: tuple[tuple[str, ...], ...] = (
+    ('kubernetes', 'k8s', 'eks', 'aks', 'gke', 'container orchestration'),
+    ('docker', 'container', 'containers', 'containerized', 'containerization', 'podman'),
+    ('postgresql', 'postgres', 'psql', 'sql', 'mysql', 'sqlite', 'relational database'),
+    ('typescript', 'ts', 'javascript', 'js', 'ecmascript'),
+    ('react', 'reactjs', 'next.js', 'nextjs', 'frontend spa'),
+    ('ci/cd', 'cicd', 'ci', 'github actions', 'gitlab ci', 'jenkins', 'continuous integration'),
+    ('etl', 'elt', 'data pipeline', 'data pipelines', 'airflow', 'ingestion'),
+    ('pytest', 'unit test', 'unit tests', 'unit testing', 'automated testing', 'integration tests', 'tdd'),
+    ('rest', 'restful', 'rest apis', 'rest api', 'http api', 'apis', 'api'),
+    ('terraform', 'iac', 'infrastructure as code', 'cloudformation', 'pulumi'),
+    ('dashboard', 'dashboards', 'kpi reporting', 'bi', 'tableau', 'power bi', 'analytics'),
+    ('aws', 'gcp', 'azure', 'cloud infrastructure', 'cloud'),
+    ('graphql', 'apollo', 'schema api'),
+    ('redis', 'memcached', 'caching', 'in-memory cache'),
+)
+
+_MICRO_PROJECT_TEMPLATES: tuple[tuple[tuple[str, ...], str], ...] = (
+    (
+        ('kubernetes', 'k8s', 'eks', 'aks', 'gke'),
+        '48h Lab: Package a sample FastAPI/Python worker into a Deployment + Service + readiness/liveness probe '
+        'YAML tested on kind/minikube; push manifests, smoke test script, and failure-recovery README to a public repo.',
+    ),
+    (
+        ('terraform', 'iac', 'pulumi'),
+        '48h Lab: Author modular Terraform config provisioning a local/cloud sandbox resource with variables, outputs, '
+        'tflint/validate CI check, and plan output screenshot documented in a public README.',
+    ),
+    (
+        ('docker', 'container', 'containerization'),
+        '48h Lab: Create a multi-stage minimal Dockerfile + docker-compose healthcheck harness running automated integration '
+        'checks against a tiny seed dataset; publish repo with build size before/after metrics.',
+    ),
+    (
+        ('graphql', 'apollo'),
+        '48h Lab: Build a typed GraphQL schema over an existing SQLite dataset with query/mutation resolvers, N+1 batching '
+        'notes, and 5 automated query tests.',
+    ),
+    (
+        ('airflow', 'etl', 'dbt', 'spark', 'kafka'),
+        '48h Lab: Build an idempotent ingestion + transform pipeline on public sample CSV data with schema validation, '
+        'retry behavior, row-count assertions, and reproducible CLI run instructions.',
+    ),
+    (
+        ('react', 'typescript', 'next.js', 'nextjs'),
+        '48h Lab: Ship a single-screen interactive React + TypeScript component backed by typed mock JSON, keyboard navigation, '
+        'and unit tests covering empty/error/loading states.',
+    ),
+)
+
+
+def _find_candidate_evidence(term: str, resume_text: str) -> str:
+    """Return verbatim resume line supporting term directly or via adjacent synonym cluster, else ''."""
+    clean_term = str(term or '').strip().lower()
+    if not clean_term or not resume_text:
+        return ''
+    lines = [ln.strip() for ln in str(resume_text).splitlines() if ln.strip()]
+
+    # Build equivalent search terms from synonym clusters containing clean_term.
+    related_terms: list[str] = [clean_term]
+    for cluster in _SKILL_SYNONYM_CLUSTERS:
+        if clean_term in cluster or any(clean_term in alias or alias in clean_term for alias in cluster if len(alias) >= 4):
+            for alias in cluster:
+                if alias != clean_term:
+                    related_terms.append(alias)
+
+    for candidate in related_terms:
+        pattern = re.compile(r'(?<![a-z0-9])' + re.escape(candidate) + r'(?![a-z0-9])', re.IGNORECASE)
+        for line in lines:
+            if pattern.search(line):
+                return line[:220]
+    return ''
+
+
+def _default_micro_project_brief(skill_name: str, job: Mapping[str, Any]) -> str:
+    low = skill_name.lower()
+    for aliases, template in _MICRO_PROJECT_TEMPLATES:
+        if any(alias == low or alias in low for alias in aliases):
+            return template
+    role = str(job.get('title') or 'this role').strip()
+    return (
+        f'48h Lab: Build a focused, reproducible mini-artifact demonstrating {skill_name} for {role} '
+        '(working code or config, 3+ automated verification checks, and a concise README explaining design trade-offs), '
+        'and publish it at a public URL before adding the skill to your resume.'
+    )
+
+
+def classify_skill_gaps(
+    resume_text: str,
+    job: Mapping[str, Any],
+    verified_gap_skills: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Deterministically split missing job terms into wording_gaps vs. blocked true_skill_gaps (D5)."""
+    base_resume = str(resume_text or '')
+    job_text = '\n'.join(
+        str(job.get(field) or '').strip()
+        for field in ('title', 'requirements', 'description')
+        if str(job.get(field) or '').strip()
+    )
+    verified_set = {str(s or '').strip().lower() for s in verified_gap_skills if str(s or '').strip()}
+
+    # Collect structured tech terms first (preserving natural casing like Kubernetes, CI/CD, GraphQL)
+    ordered_terms: list[str] = []
+    seen_lower: set[str] = set()
+    for m in _TECH_TERM_RE.finditer(job_text):
+        tok = m.group(0).strip()
+        low = tok.lower()
+        if low not in seen_lower:
+            seen_lower.add(low)
+            ordered_terms.append(tok)
+
+    # Supplement with unmatched high-signal keywords from match_resume
+    match_out = match_resume(base_resume, job_text)
+    for kw in match_out.get('unmatched_job_keywords') or []:
+        clean_kw = str(kw).strip('.,;:()[]')
+        low = clean_kw.lower()
+        if (
+            not low
+            or low in seen_lower
+            or low in STOP
+            or low in _GENERIC_FILLER_GAP_WORDS
+            or len(low) < 3
+        ):
+            continue
+        seen_lower.add(low)
+        ordered_terms.append(clean_kw)
+
+    resume_tech_lower = {m.group(0).strip().lower() for m in _TECH_TERM_RE.finditer(base_resume)}
+    resume_kw_lower = keywords(base_resume)
+
+    wording_gaps: list[dict[str, str]] = []
+    skill_gaps: list[dict[str, Any]] = []
+
+    for term in ordered_terms:
+        low = term.lower()
+        # Already literally present in base resume
+        if low in resume_tech_lower or low in resume_kw_lower:
+            continue
+        # Adjacent or synonym evidence exists verbatim in candidate resume -> wording_gap
+        evidence = _find_candidate_evidence(low, base_resume)
+        if evidence:
+            wording_gaps.append({
+                'job_term': term,
+                'candidate_evidence': evidence,
+            })
+            continue
+        # Otherwise missing from base resume -> true_skill_gap (verified only if proof artifact exists)
+        is_verified = low in verified_set
+        skill_gaps.append({
+            'skill_name': term,
+            'gap_type': 'true_skill_gap',
+            'micro_project_brief': _default_micro_project_brief(term, job),
+            'verified': is_verified,
+        })
+        if len(skill_gaps) >= 8 and len(wording_gaps) >= 6:
+            break
+
+    return {
+        'wording_gaps': wording_gaps[:8],
+        'skill_gaps': skill_gaps[:8],
+        'matched_keywords': list(match_out.get('shared_keywords') or []),
+        'fit_score': int(match_out.get('score') or 0),
+    }
+
+
+def summarize_resume_diff(master_resume: str, tailored_resume: str, limit: int = 5) -> list[dict[str, str]]:
+    """Produce concise diffs comparing master_resume lines against tailored_resume lines."""
+    master_lines = [ln.strip() for ln in str(master_resume or '').splitlines() if ln.strip()]
+    tailored_lines = [ln.strip() for ln in str(tailored_resume or '').splitlines() if ln.strip()]
+    if not tailored_lines:
+        return []
+    if master_lines == tailored_lines:
+        return []
+
+    matcher = difflib.SequenceMatcher(None, master_lines, tailored_lines)
+    diffs: list[dict[str, str]] = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == 'equal':
+            continue
+        orig_chunk = ' | '.join(master_lines[i1:i2])
+        edit_chunk = ' | '.join(tailored_lines[j1:j2])
+        if tag == 'insert':
+            summary = f'Added tailored section/line: {edit_chunk[:120]}'
+        elif tag == 'delete':
+            summary = f'Trimmed line: {orig_chunk[:120]}'
+        else:
+            summary = f'Updated "{orig_chunk[:70]}" -> "{edit_chunk[:70]}"'
+        diffs.append({
+            'change_type': tag,
+            'original': orig_chunk,
+            'edited': edit_chunk,
+            'summary': summary,
+        })
+        if len(diffs) >= limit:
+            break
+    return diffs
+
+
+def generate_probe_questions(
+    resume_text: str,
+    tailored_text: str,
+    job: Mapping[str, Any],
+    verified_gap_proofs: Sequence[Mapping[str, Any]] = (),
+) -> list[str]:
+    """Generate 3 likely interviewer deep-dive questions tied to highlighted bullets and gap proofs."""
+    combined_resume = str(tailored_text or resume_text or '').strip()
+    lines = [ln.strip(' -*\t') for ln in combined_resume.splitlines() if len(ln.strip()) >= 18]
+    job_title = str(job.get('title') or 'this role').strip()
+    company = str(job.get('company') or 'the team').strip()
+    job_desc = '\n'.join(
+        str(job.get(f) or '') for f in ('title', 'requirements', 'description') if job.get(f)
+    )
+    shared = list((match_resume(combined_resume, job_desc).get('shared_keywords') or []))
+    missing = list((match_resume(combined_resume, job_desc).get('unmatched_job_keywords') or []))
+
+    questions: list[str] = []
+
+    # Question 1: Metric-bearing or experience bullet probe
+    metric_line = next(
+        (ln for ln in lines if _extract_meaningful_metrics(ln)),
+        lines[1] if len(lines) > 1 else (lines[0] if lines else ''),
+    )
+    if metric_line:
+        snippet = metric_line[:110].rstrip('.')
+        questions.append(
+            f'Deep-dive on "{snippet}": What architectural trade-offs did you evaluate and how did you validate the outcome?'
+        )
+
+    # Question 2: Top role-overlap technical depth probe
+    if shared:
+        focus = ', '.join(shared[:3])
+        questions.append(
+            f'For {job_title} at {company}, describe a production bug, scaling limit, or edge case you solved involving {focus}.'
+        )
+
+    # Question 3: Verified proof-of-skill project OR priority gap readiness probe
+    verified_list = [p for p in (verified_gap_proofs or ()) if str(p.get('skill_name') or '').strip()]
+    if verified_list:
+        proof = verified_list[0]
+        skill = str(proof.get('skill_name')).strip()
+        proof_url = str(proof.get('proof_url') or '').strip()
+        ref = f' ({proof_url})' if proof_url else ''
+        questions.append(
+            f'You showcased verified proof-of-work in {skill}{ref}: what did you test to prove correctness and how would you extend it at scale?'
+        )
+    elif missing:
+        gap_focus = ', '.join(missing[:2])
+        questions.append(
+            f'How would you ramp up on {gap_focus} during your first 30 days using the systems fundamentals already on your resume?'
+        )
+
+    defaults = [
+        f'Which project on your tailored resume best demonstrates readiness for {job_title} at {company}, and why?',
+        'Walk through how you debugged a failure from logs or metrics to root-cause fix and regression test.',
+        'If given ambiguous requirements on week one, what clarifying questions and milestones would you propose?',
+    ]
+    for q in defaults:
+        if len(questions) >= 3:
+            break
+        if q not in questions:
+            questions.append(q)
+
+    return questions[:3]
 

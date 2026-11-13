@@ -1,6 +1,7 @@
 import base64
 import io
 import json
+import socket
 import tempfile
 import unittest
 import urllib.error
@@ -1512,6 +1513,420 @@ class AntiSlopTailorAndPreviewTests(unittest.TestCase):
         # Unimplemented A-05 route still returns 501
         code_501, _ = routes_pipeline.handle_post('/api/pipeline/gaps', {})
         self.assertEqual(code_501, 501)
+
+
+from app.adapters import GapAnalysisResult
+from app.adapters_pipeline import CallbackCheatSheetBuilder, GapBridgeAdapter, GapBridgeError, build_callback_packet
+
+
+def _fake_public_getaddrinfo(host, *args, **kwargs):
+    clean = str(host or '').strip().lower()
+    if clean in ('127.0.0.1', 'localhost', '::1'):
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, '', ('127.0.0.1', 0))]
+    if clean in ('169.254.169.254', '10.0.0.1'):
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, '', (clean, 0))]
+    return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, '', ('140.82.121.4', 0))]
+
+
+class GapBridgeAndCallbackTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._db_path = Path(self._tmp.name) / 'test_gaps_callback.sqlite3'
+        self._patch = mock.patch.object(db, 'DB_PATH', self._db_path)
+        self._dns_patch = mock.patch('socket.getaddrinfo', side_effect=_fake_public_getaddrinfo)
+        self._patch.start()
+        self._dns_patch.start()
+        db.init_db()
+        self.sample_resume = (
+            'Jordan Taylor\n'
+            'Seattle, WA | jordan.taylor@example.org\n'
+            'Skills: Python, SQL, RESTful Services, Automated Testing, CI/CD\n'
+            'Experience:\n'
+            '- Software Engineer, Northwind Systems (2023-2026): Built Python web services and SQL ETL pipelines, '
+            'cut latency by 20% across 12 production tables, and automated regression test suites.\n'
+        )
+        self.sample_job = {
+            'id': 1,
+            'title': 'Platform Backend Engineer',
+            'company': 'Contoso Cloud',
+            'location': 'Seattle, WA',
+            'description': 'Design Python APIs, REST APIs, pytest test harnesses, Kubernetes deployments, and Terraform modules.',
+            'requirements': 'Python, REST APIs, pytest, Kubernetes, Terraform',
+            'url': 'https://boards.greenhouse.io/contoso/jobs/9550',
+            'ats_family': 'greenhouse',
+        }
+
+    def tearDown(self):
+        self._dns_patch.stop()
+        self._patch.stop()
+        self._tmp.cleanup()
+
+    def test_classify_skill_gaps_wording_vs_true_skill_gaps(self):
+        gaps = engine.classify_skill_gaps(self.sample_resume, self.sample_job)
+        wording_terms = {w['job_term'].lower(): w['candidate_evidence'] for w in gaps['wording_gaps']}
+        true_skills = {s['skill_name'].lower(): s['micro_project_brief'] for s in gaps['skill_gaps']}
+
+        self.assertIn('pytest', wording_terms)
+        self.assertIn('rest', wording_terms)
+        self.assertTrue(wording_terms['pytest'])
+        self.assertIn('kubernetes', true_skills)
+        self.assertIn('terraform', true_skills)
+        self.assertIn('48', true_skills['kubernetes'])
+
+        unlocked = engine.classify_skill_gaps(
+            self.sample_resume,
+            self.sample_job,
+            verified_gap_skills=['Kubernetes'],
+        )
+        unlocked_map = {s['skill_name'].lower(): s['verified'] for s in unlocked['skill_gaps']}
+        self.assertTrue(unlocked_map['kubernetes'])
+        self.assertFalse(unlocked_map['terraform'])
+
+    def test_gap_bridge_adapter_offline_mocked_llm_untrusted_demotion_and_ssrf_guard(self):
+        offline_model = UnifiedModelAdapter(environ={}, env_path=None, config={'llm_provider': 'auto'})
+        offline = GapBridgeAdapter(model_adapter=offline_model).analyze(self.sample_resume, self.sample_job, mode='auto')
+        self.assertIsInstance(offline['result'], GapAnalysisResult)
+        self.assertEqual(offline['generation_mode'], 'deterministic_no_llm')
+        schema_art = offline['schema_artifact']
+        self.assertEqual(set(schema_art.keys()), {'job_id', 'wording_gaps', 'skill_gaps'})
+        self.assertIsInstance(schema_art['job_id'], str)
+        for item in schema_art['skill_gaps']:
+            self.assertEqual(set(item.keys()), {'skill_name', 'micro_project_brief', 'proof_url', 'verified'})
+            self.assertIsNone(item['proof_url'])
+            self.assertFalse(item['verified'])
+
+        captured_payloads: list[dict] = []
+
+        def fake_gemini_transport(url, headers, payload, timeout):
+            captured_payloads.append(payload)
+            return {
+                'steps': [{
+                    'type': 'model_output',
+                    'content': [{
+                        'type': 'text',
+                        'text': json.dumps({
+                            'wording_gaps': [
+                                {
+                                    'job_term': 'Unit Testing',
+                                    'candidate_evidence': 'automated regression test suites',
+                                },
+                                {
+                                    'job_term': 'GraphQL',
+                                    'candidate_evidence': 'Led global GraphQL federation for 50 services',
+                                },
+                            ],
+                            'skill_gaps': [
+                                {
+                                    'skill_name': 'Kubernetes',
+                                    'micro_project_brief': 'Ship a 2-pod k8s Deployment + readiness probe repo in 48h.',
+                                },
+                            ],
+                        }),
+                    }],
+                }],
+            }
+
+        llm_model = UnifiedModelAdapter(
+            provider='gemini',
+            api_key='TEST_GEMINI_KEY',
+            environ={},
+            env_path=None,
+            config={'llm_provider': 'gemini', 'llm_model': 'gemini-3.8-flash'},
+            transport=fake_gemini_transport,
+            sleep_fn=lambda _: None,
+        )
+        llm_out = GapBridgeAdapter(model_adapter=llm_model).analyze(self.sample_resume, self.sample_job, mode='auto')
+        self.assertEqual(llm_out['generation_mode'], 'llm')
+        self.assertIn('<UNTRUSTED_DATA', json.dumps(captured_payloads[0]))
+        wording_terms = {w['job_term'].lower() for w in llm_out['wording_gaps']}
+        skill_names = {s['skill_name'].lower() for s in llm_out['skill_gaps']}
+        # Grounded LLM wording gap stays in wording_gaps; ungrounded GraphQL evidence gets demoted into skill_gaps
+        self.assertIn('unit testing', wording_terms)
+        self.assertNotIn('graphql', wording_terms)
+        self.assertIn('graphql', skill_names)
+        self.assertIn('kubernetes', skill_names)
+
+        # SSRF proof URL checks
+        for bad_url in (
+            'javascript:alert(1)',
+            'http://127.0.0.1:8080/proof',
+            'http://169.254.169.254/latest/meta-data',
+            'http://10.0.0.1/internal',
+            'ftp://example.com/repo',
+        ):
+            with self.assertRaises(GapBridgeError):
+                GapBridgeAdapter.validate_proof_url(bad_url)
+        self.assertEqual(
+            GapBridgeAdapter.validate_proof_url(' https://github.com/jordan/k8s-proof '),
+            'https://github.com/jordan/k8s-proof',
+        )
+
+    def test_gap_routes_schema_validation_proof_verify_and_tailor_unlock(self):
+        code_status, body_status = routes_pipeline.handle_get('/api/pipeline/status')
+        self.assertEqual(code_status, 200)
+        self.assertIn('A-05', body_status['tasks_completed'])
+        self.assertTrue(body_status['gap_bridge_adapter']['implemented'])
+
+        gap_schema = json.loads(
+            (Path(__file__).resolve().parent.parent / 'schemas' / 'gap_artifact.schema.json').read_text(encoding='utf-8')
+        )
+        allowed_wg_keys = set(gap_schema['properties']['wording_gaps']['items']['properties'].keys())
+        allowed_sg_keys = set(gap_schema['properties']['skill_gaps']['items']['properties'].keys())
+
+        with db.connection() as con:
+            con.execute('UPDATE profile SET resume=? WHERE id=1', (self.sample_resume,))
+            job_id = con.execute(
+                'INSERT INTO jobs(title, company, location, description, url, ats_family) VALUES(?,?,?,?,?,?)',
+                (
+                    self.sample_job['title'],
+                    self.sample_job['company'],
+                    self.sample_job['location'],
+                    self.sample_job['description'] + ' Requirements: ' + self.sample_job['requirements'],
+                    self.sample_job['url'],
+                    'greenhouse',
+                ),
+            ).lastrowid
+
+        code_an, body_an = routes_pipeline.handle_post(
+            '/api/pipeline/gaps/analyze',
+            {'job_id': job_id, 'mode': 'heuristic'},
+        )
+        self.assertEqual(code_an, 200)
+        schema_art = body_an['schema_artifact']
+        self.assertEqual(schema_art['job_id'], str(job_id))
+        self.assertEqual(set(schema_art.keys()), set(gap_schema['required']))
+        for item in schema_art['wording_gaps']:
+            self.assertEqual(set(item.keys()), allowed_wg_keys)
+        for item in schema_art['skill_gaps']:
+            self.assertEqual(set(item.keys()), allowed_sg_keys)
+            self.assertIsNone(item['proof_url'])
+            self.assertFalse(item['verified'])
+
+        # GET routes read back persisted gap artifacts
+        code_all, body_all = routes_pipeline.handle_get('/api/pipeline/gaps')
+        self.assertEqual(code_all, 200)
+        self.assertGreaterEqual(body_all['count'], 1)
+        code_job_g, body_job_g = routes_pipeline.handle_get(f'/api/pipeline/jobs/{job_id}/gaps')
+        self.assertEqual(code_job_g, 200)
+        self.assertEqual(len(body_job_g['skill_gaps']), len(body_an['skill_gaps']))
+
+        # Before verifying proof, Kubernetes stays excluded from verified_gap_skills during tailor
+        code_p1, body_p1 = routes_pipeline.handle_post(
+            '/api/pipeline/prepare-ai',
+            {'job_id': job_id, 'mode': 'heuristic'},
+        )
+        self.assertEqual(code_p1, 200)
+        self.assertEqual(body_p1['verified_gap_skills'], [])
+        app_id = body_p1['application']['id']
+
+        k8s_gap = next(s for s in body_an['skill_gaps'] if s['skill_name'].lower() == 'kubernetes')
+        wg_item = body_an['wording_gaps'][0]
+
+        # Reject wording_gap verification and unsafe SSRF URL
+        code_wg_bad, _ = routes_pipeline.handle_post(
+            f"/api/pipeline/gaps/{wg_item['id']}/verify",
+            {'proof_url': 'https://github.com/jordan/test'},
+        )
+        self.assertEqual(code_wg_bad, 400)
+        code_ssrf, _ = routes_pipeline.handle_post(
+            f"/api/pipeline/gaps/{k8s_gap['id']}/verify",
+            {'proof_url': 'http://127.0.0.1:9000/bad'},
+        )
+        self.assertEqual(code_ssrf, 400)
+
+        # Verify Kubernetes proof URL
+        proof_url = 'https://github.com/jordan/k8s-deployment-proof'
+        code_ver, body_ver = routes_pipeline.handle_post(
+            f"/api/pipeline/gaps/{k8s_gap['id']}/verify",
+            {'proof_url': proof_url},
+        )
+        self.assertEqual(code_ver, 200)
+        self.assertEqual(body_ver['unlocked_skill'].lower(), 'kubernetes')
+        self.assertTrue(body_ver['artifact']['verified'])
+        self.assertIn(body_ver['unlocked_skill'], body_ver['verified_gap_skills'])
+
+        # Re-running analyze must preserve existing verified proof!
+        code_rean, body_rean = routes_pipeline.handle_post(
+            '/api/pipeline/gaps/analyze',
+            {'job_id': job_id, 'mode': 'heuristic'},
+        )
+        self.assertEqual(code_rean, 200)
+        re_k8s = next(s for s in body_rean['skill_gaps'] if s['skill_name'].lower() == 'kubernetes')
+        self.assertTrue(re_k8s['verified'])
+        self.assertEqual(re_k8s['proof_url'], proof_url)
+
+        # Re-running prepare-ai unlocks Kubernetes and updates callback_packet_json
+        code_p2, body_p2 = routes_pipeline.handle_post(
+            '/api/pipeline/prepare-ai',
+            {'job_id': job_id, 'application_id': app_id, 'mode': 'heuristic'},
+        )
+        self.assertEqual(code_p2, 200)
+        self.assertIn('Kubernetes', body_p2['verified_gap_skills'])
+        cb = body_p2['application']['callback_packet']
+        self.assertTrue(any(p['proof_url'] == proof_url for p in cb['verified_gap_proofs']))
+        self.assertEqual(len(cb['probe_questions']), 3)
+
+        # Contract compatibility: POST /api/pipeline/gaps still returns 501
+        code_501, _ = routes_pipeline.handle_post('/api/pipeline/gaps', {})
+        self.assertEqual(code_501, 501)
+
+    def test_callback_packet_auto_population_across_prepare_copilot_confirm_and_immutability(self):
+        # Test CallbackCheatSheetBuilder LLM wrapping with mock transport
+        captured: list[dict] = []
+
+        def fake_gemini_cb(url, headers, payload, timeout):
+            captured.append(payload)
+            return {
+                'steps': [{
+                    'type': 'model_output',
+                    'content': [{
+                        'type': 'text',
+                        'text': json.dumps({
+                            'why_this_role': 'Built Python services and Kubernetes proof directly aligned with Contoso Cloud.',
+                            'probe_questions': [
+                                'Walk through your Kubernetes readiness probe setup in the GitHub proof repo.',
+                                'How did you validate your 20% SQL ETL latency reduction across 12 tables?',
+                                'How do you design idempotent REST APIs for platform consumers?',
+                            ],
+                        }),
+                    }],
+                }],
+            }
+
+        cb_llm = CallbackCheatSheetBuilder(
+            model_adapter=UnifiedModelAdapter(
+                provider='gemini',
+                api_key='TEST_GEMINI_KEY',
+                environ={},
+                env_path=None,
+                config={'llm_provider': 'gemini', 'llm_model': 'gemini-3.8-flash'},
+                transport=fake_gemini_cb,
+                sleep_fn=lambda _: None,
+            )
+        ).build(
+            self.sample_job,
+            self.sample_resume,
+            self.sample_resume + '\nVerified Proof-of-Skill Project: Kubernetes',
+            verified_gap_proofs=[{'skill_name': 'Kubernetes', 'proof_url': 'https://github.com/jordan/k8s'}],
+            mode='llm',
+        )
+        self.assertEqual(cb_llm['callback_generation_mode'], 'llm')
+        self.assertEqual(len(cb_llm['probe_questions']), 3)
+        self.assertIn('<UNTRUSTED_DATA', json.dumps(captured[0]))
+
+        # Seed profile, job, verified proof, and walk prepare-ai -> copilot -> confirm -> immutable checks
+        with db.connection() as con:
+            con.execute('UPDATE profile SET resume=? WHERE id=1', (self.sample_resume,))
+            job_id = con.execute(
+                'INSERT INTO jobs(title, company, location, description, url, origin, ats_family) VALUES(?,?,?,?,?,?,?)',
+                (
+                    self.sample_job['title'],
+                    self.sample_job['company'],
+                    self.sample_job['location'],
+                    self.sample_job['description'],
+                    self.sample_job['url'],
+                    'imported_url',
+                    'greenhouse',
+                ),
+            ).lastrowid
+            con.execute(
+                'INSERT INTO gap_artifacts(job_id, skill_name, gap_type, micro_project_brief, proof_url, verified) '
+                "VALUES(?, 'Kubernetes', 'true_skill_gap', '48h k8s deployment brief', 'https://github.com/jordan/k8s', 1)",
+                (job_id,),
+            )
+
+        code_prep, body_prep = routes_pipeline.handle_post(
+            '/api/pipeline/prepare-ai',
+            {'job_id': job_id, 'mode': 'heuristic'},
+        )
+        self.assertEqual(code_prep, 200)
+        app_id = body_prep['application']['id']
+        cb1 = body_prep['application']['callback_packet']
+        self.assertTrue(cb1['why_this_role'])
+        self.assertEqual(len(cb1['probe_questions']), 3)
+        self.assertIsInstance(cb1['diff_summary'], list)
+
+        # Co-Pilot merges non-sensitive answers and keeps sensitive fields out of callback_packet_json
+        code_cop, body_cop = routes_pipeline.handle_post(
+            f'/api/pipeline/applications/{app_id}/copilot',
+            {
+                'candidate_answers': {'why_company_and_role': 'Excited to scale Contoso Cloud APIs with tested Python services.'},
+                'sensitive_answers': {'work_authorization': 'US Citizen', 'salary_expectation': '$160k'},
+            },
+        )
+        self.assertEqual(code_cop, 200)
+        cb2 = body_cop['application']['callback_packet']
+        self.assertIn('why_company_and_role', cb2['submitted_answers'])
+        self.assertNotIn('salary_expectation', cb2['submitted_answers'])
+        self.assertNotIn('work_authorization', cb2['submitted_answers'])
+
+        # Confirm updates hashes + confirmation_reference in callback_packet_json
+        code_conf, body_conf = routes_pipeline.handle_post(
+            f'/api/pipeline/applications/{app_id}/confirm',
+            {
+                'explicit_user_approval': True,
+                'sensitive_fields_confirmed': True,
+                'sensitive_answers': {
+                    'work_authorization': 'Yes',
+                    'visa_sponsorship': 'No',
+                    'salary_expectation': '$160k',
+                    'veteran_status': 'Prefer not to say',
+                    'disability_status': 'Prefer not to say',
+                    'references': 'Available upon request',
+                },
+                'outcome': 'confirmed',
+                'confirmation_reference': 'GH-CONF-A05-777',
+            },
+        )
+        self.assertEqual(code_conf, 200)
+        cb3 = body_conf['application']['callback_packet']
+        self.assertEqual(cb3['confirmation_reference'], 'GH-CONF-A05-777')
+        self.assertTrue(cb3['submitted_answers']['sensitive_fields_confirmed'])
+        self.assertTrue(cb3['resume_sha256'])
+        self.assertTrue(cb3['answers_sha256'])
+        self.assertEqual(len(cb3['probe_questions']), 3)
+
+        # Confirmed application immutability on GET & POST /callback-packet
+        code_get_cb, body_get_cb = routes_pipeline.handle_get(f'/api/pipeline/applications/{app_id}/callback-packet')
+        self.assertEqual(code_get_cb, 200)
+        self.assertTrue(body_get_cb['immutable'])
+
+        code_post_idemp, body_post_idemp = routes_pipeline.handle_post(
+            f'/api/pipeline/applications/{app_id}/callback-packet',
+            {},
+        )
+        self.assertEqual(code_post_idemp, 200)
+        self.assertTrue(body_post_idemp['immutable'])
+
+        code_post_mut, _ = routes_pipeline.handle_post(
+            f'/api/pipeline/applications/{app_id}/callback-packet',
+            {'why_this_role': 'Attempted tamper override', 'force': True},
+        )
+        self.assertEqual(code_post_mut, 409)
+
+        # Demo test_submitted stays isolated from callback updates (uses distinct demo job_id due to UNIQUE job_id)
+        with db.connection() as con:
+            demo_job_id = con.execute(
+                'INSERT INTO jobs(title, company, location, description, url, origin, ats_family) VALUES(?,?,?,?,?,?,?)',
+                (
+                    'Demo Role',
+                    'Demo Corp',
+                    'Remote',
+                    'Python backend service role.',
+                    'https://example.com/jobs/demo-1',
+                    'fictional-sample',
+                    'unknown',
+                ),
+            ).lastrowid
+            demo_app_id = con.execute(
+                "INSERT INTO applications(job_id, tailored_resume, fit_score, status, confirmation) VALUES(?,?,?,'test_submitted',?)",
+                (demo_job_id, 'A' * 80, 75, 'DEMO ONLY - no job site contacted'),
+            ).lastrowid
+        code_demo_409, _ = routes_pipeline.handle_post(
+            f'/api/pipeline/applications/{demo_app_id}/callback-packet',
+            {'mode': 'heuristic'},
+        )
+        self.assertEqual(code_demo_409, 409)
 
 
 if __name__ == '__main__':

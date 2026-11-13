@@ -16,7 +16,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 import zlib
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
 import hashlib
 from datetime import datetime, timezone
@@ -28,6 +28,7 @@ from .adapters import (
     ActionResult,
     ApplicationAdapter,
     CoPilotPacket,
+    GapAnalysisResult,
     JobDiscoveryAdapter,
     JobPreflight,
     ModelAdapter,
@@ -1688,21 +1689,16 @@ class CoPilotApplicationAdapter(ApplicationAdapter):
         flow = _PORTAL_SECTION_FLOWS.get(ats_family, _DEFAULT_PORTAL_FLOW)
         ordered_sections = [section_map[section_key] for section_key in flow]
 
-        overlap_note = (
-            f"Candidate resume aligns on {', '.join(shared_terms[:6])}."
-            if shared_terms
-            else 'Candidate manually reviewed alignment with the role requirements.'
+        master_resume_text = str(profile.get('resume') or resume_text).strip()
+        callback_packet = build_callback_packet(
+            job,
+            master_resume_text,
+            resume_text,
+            existing_cb={'shared_keywords': shared_terms[:12]},
+            candidate_answers=saved_answers,
+            resume_sha256=compute_sha256_text(resume_text),
+            generation_mode='copilot_stage',
         )
-        callback_packet = {
-            'job_title': str(job.get('title') or ''),
-            'company': str(job.get('company') or ''),
-            'job_url': url,
-            'ats_family': ats_family,
-            'why_this_role': str(saved_answers.get('why_company_and_role') or overlap_note),
-            'submitted_answers': dict(saved_answers),
-            'shared_keywords': shared_terms[:12],
-            'probe_questions': [],
-        }
 
         return CoPilotPacket(
             job_id=int(job.get('id') or 0),
@@ -2250,5 +2246,468 @@ def tailor_resume_for_job(
 ) -> dict[str, Any]:
     """Module-level helper invoking VoicePreservingTailorAdapter().tailor(...)."""
     return VoicePreservingTailorAdapter().tailor(resume_text, job, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Task A-05: D5 Gap-to-Proof Bridge & D2 30-Second Callback Cheat Sheet Builder
+# ---------------------------------------------------------------------------
+
+_GAP_OUTPUT_SCHEMA: dict[str, Any] = {
+    'type': 'object',
+    'additionalProperties': False,
+    'required': ['wording_gaps', 'skill_gaps'],
+    'properties': {
+        'wording_gaps': {
+            'type': 'array',
+            'items': {
+                'type': 'object',
+                'additionalProperties': False,
+                'required': ['job_term', 'candidate_evidence'],
+                'properties': {
+                    'job_term': {'type': 'string'},
+                    'candidate_evidence': {'type': 'string'},
+                },
+            },
+        },
+        'skill_gaps': {
+            'type': 'array',
+            'items': {
+                'type': 'object',
+                'additionalProperties': False,
+                'required': ['skill_name', 'micro_project_brief'],
+                'properties': {
+                    'skill_name': {'type': 'string'},
+                    'micro_project_brief': {'type': 'string'},
+                },
+            },
+        },
+    },
+}
+
+_CALLBACK_OUTPUT_SCHEMA: dict[str, Any] = {
+    'type': 'object',
+    'additionalProperties': False,
+    'required': ['why_this_role', 'probe_questions'],
+    'properties': {
+        'why_this_role': {'type': 'string'},
+        'probe_questions': {
+            'type': 'array',
+            'items': {'type': 'string'},
+        },
+    },
+}
+
+
+class GapBridgeError(ValueError):
+    """Raised on invalid D5 gap analysis input or unsafe proof URLs."""
+
+
+def _build_schema_gap_artifact(
+    job_id: Any,
+    wording_gaps: Sequence[Mapping[str, Any]],
+    skill_gaps: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Format strictly against schemas/gap_artifact.schema.json."""
+    clean_wording = [
+        {
+            'job_term': str(w.get('job_term') or '').strip(),
+            'candidate_evidence': str(w.get('candidate_evidence') or '').strip(),
+        }
+        for w in wording_gaps
+        if str(w.get('job_term') or '').strip() and str(w.get('candidate_evidence') or '').strip()
+    ]
+    clean_skills = [
+        {
+            'skill_name': str(s.get('skill_name') or '').strip(),
+            'micro_project_brief': str(s.get('micro_project_brief') or '').strip(),
+            'proof_url': (str(s.get('proof_url')).strip() if str(s.get('proof_url') or '').strip() else None),
+            'verified': bool(s.get('verified', False)),
+        }
+        for s in skill_gaps
+        if str(s.get('skill_name') or '').strip()
+    ]
+    return {
+        'job_id': str(job_id),
+        'wording_gaps': clean_wording,
+        'skill_gaps': clean_skills,
+    }
+
+
+class GapBridgeAdapter:
+    """D5 Gap-to-Proof Bridge: wording vs. true skill gaps, 48h micro-projects, and URL proof verification."""
+
+    def __init__(self, model_adapter: Optional[UnifiedModelAdapter] = None):
+        self.model_adapter = model_adapter
+
+    @classmethod
+    def inspect_capabilities(cls) -> dict[str, Any]:
+        return {
+            'implemented': True,
+            'ssrf_proof_url_guard': True,
+            'supported_modes': ['auto', 'llm', 'heuristic'],
+            'model_capabilities': UnifiedModelAdapter.inspect_capabilities(),
+        }
+
+    @staticmethod
+    def validate_proof_url(proof_url: str) -> str:
+        clean = str(proof_url or '').strip()
+        if not clean:
+            raise GapBridgeError('proof_url is required.')
+        try:
+            engine.valid_public_url(clean)
+        except ValueError as exc:
+            raise GapBridgeError(str(exc)) from exc
+        return clean
+
+    @staticmethod
+    def _is_snippet_grounded(snippet: str, norm_resume: str, resume_tokens: set[str]) -> bool:
+        clean_snip = engine._normalize_ws(snippet)
+        if not clean_snip:
+            return False
+        if len(clean_snip) >= 4 and clean_snip in norm_resume:
+            return True
+        tokens = [t for t in re.findall(r'[a-z0-9+#.-]{3,}', clean_snip)]
+        if not tokens:
+            return False
+        overlap = sum(1 for tok in tokens if tok in resume_tokens) / len(tokens)
+        return overlap >= 0.75
+
+    def analyze(
+        self,
+        resume_text: str,
+        job: Mapping[str, Any],
+        existing_artifacts: Iterable[Mapping[str, Any]] = (),
+        mode: str = 'auto',
+    ) -> dict[str, Any]:
+        """Classify role gaps into wording_gap vs true_skill_gap with 48h briefs and schema output."""
+        base_resume = str(resume_text or '').strip()
+        if len(base_resume) < 50:
+            raise GapBridgeError('Candidate resume must contain at least 50 characters before gap analysis.')
+        chosen_mode = str(mode or 'auto').strip().lower()
+        if chosen_mode not in ('auto', 'llm', 'heuristic'):
+            raise GapBridgeError('mode must be one of: auto, llm, heuristic.')
+
+        existing_by_skill: dict[str, dict[str, Any]] = {}
+        verified_skills: list[str] = []
+        for art in existing_artifacts or ():
+            if not isinstance(art, Mapping):
+                continue
+            skill = str(art.get('skill_name') or '').strip()
+            if not skill:
+                continue
+            low = skill.lower()
+            existing_by_skill[low] = dict(art)
+            if bool(art.get('verified')):
+                verified_skills.append(skill)
+
+        det = engine.classify_skill_gaps(base_resume, job, verified_gap_skills=verified_skills)
+        wording_gaps = list(det['wording_gaps'])
+        det_skills = list(det['skill_gaps'])
+
+        provider: Optional[str] = None
+        model: Optional[str] = None
+        if chosen_mode == 'heuristic':
+            generation_mode = 'deterministic_heuristic'
+        else:
+            adapter = self.model_adapter or UnifiedModelAdapter()
+            llm_ready = True
+            if chosen_mode == 'auto':
+                try:
+                    adapter.resolve_provider_and_key()
+                except ModelNotConfiguredError:
+                    llm_ready = False
+            if not llm_ready:
+                generation_mode = 'deterministic_no_llm'
+            else:
+                job_block = '\n'.join([
+                    f"Title: {job.get('title', '')}",
+                    f"Company: {job.get('company', '')}",
+                    f"Requirements: {job.get('requirements', '')}",
+                    f"Description: {job.get('description', '')}",
+                ])
+                user_data = '\n\n'.join([
+                    'Task: Classify missing job skills honestly as wording_gaps (only if exact verbatim evidence exists in candidate_resume) '
+                    'vs true skill_gaps requiring a concrete 48-hour micro_project_brief.',
+                    'Return JSON with keys: wording_gaps ([{job_term, candidate_evidence}]), skill_gaps ([{skill_name, micro_project_brief}]).',
+                    _wrap_untrusted('candidate_resume', base_resume),
+                    _wrap_untrusted('job_posting', job_block),
+                    _wrap_untrusted('deterministic_gap_baseline', json.dumps({'wording_gaps': wording_gaps, 'skill_gaps': det_skills}, ensure_ascii=False)),
+                ])
+                llm_out = adapter.generate_from_prompt(
+                    'job_analysis_prompt',
+                    user_data,
+                    output_schema=_GAP_OUTPUT_SCHEMA,
+                    include_system_guardrails=True,
+                )
+                generation_mode = 'llm'
+                provider = adapter.last_metadata.get('provider')
+                model = adapter.last_metadata.get('model')
+
+                norm_resume = engine._normalize_ws(base_resume)
+                resume_tokens = set(re.findall(r'[a-z0-9+#.-]{3,}', norm_resume))
+                llm_wording = llm_out.get('wording_gaps') if isinstance(llm_out, Mapping) else []
+                llm_skills = llm_out.get('skill_gaps') if isinstance(llm_out, Mapping) else []
+
+                # Merge LLM wording gaps ONLY when candidate_evidence is actually grounded in base_resume!
+                seen_wording = {w['job_term'].lower() for w in wording_gaps}
+                demoted_gaps: list[dict[str, Any]] = []
+                for item in llm_wording or []:
+                    if not isinstance(item, Mapping):
+                        continue
+                    term = str(item.get('job_term') or '').strip()
+                    ev = str(item.get('candidate_evidence') or '').strip()
+                    if not term:
+                        continue
+                    if ev and self._is_snippet_grounded(ev, norm_resume, resume_tokens):
+                        if term.lower() not in seen_wording:
+                            seen_wording.add(term.lower())
+                            wording_gaps.append({'job_term': term, 'candidate_evidence': ev[:220]})
+                    else:
+                        # LLM failed to cite grounded resume snippet -> block into true_skill_gap
+                        demoted_gaps.append({
+                            'skill_name': term,
+                            'micro_project_brief': engine._default_micro_project_brief(term, job),
+                        })
+
+                brief_by_skill: dict[str, str] = {}
+                for s in [*(llm_skills or []), *demoted_gaps]:
+                    if not isinstance(s, Mapping):
+                        continue
+                    sname = str(s.get('skill_name') or '').strip()
+                    sbrief = str(s.get('micro_project_brief') or '').strip()
+                    if not sname:
+                        continue
+                    low = sname.lower()
+                    if low in seen_wording:
+                        continue
+                    if sbrief and not brief_by_skill.get(low):
+                        brief_by_skill[low] = sbrief
+                    if not any(ds['skill_name'].lower() == low for ds in det_skills):
+                        det_skills.append({
+                            'skill_name': sname,
+                            'gap_type': 'true_skill_gap',
+                            'micro_project_brief': sbrief or engine._default_micro_project_brief(sname, job),
+                            'verified': low in {v.lower() for v in verified_skills},
+                        })
+                for ds in det_skills:
+                    override = brief_by_skill.get(ds['skill_name'].lower())
+                    if override:
+                        ds['micro_project_brief'] = override
+
+        # Merge stored proof_url & verified state cleanly; keep already verified rows present even if filtered.
+        merged_skills: list[dict[str, Any]] = []
+        seen_skills: set[str] = set()
+        for entry in det_skills:
+            sname = str(entry.get('skill_name') or '').strip()
+            low = sname.lower()
+            if not sname or low in seen_skills:
+                continue
+            seen_skills.add(low)
+            prev = existing_by_skill.get(low, {})
+            is_verified = bool(prev.get('verified')) or bool(entry.get('verified'))
+            proof_url = str(prev.get('proof_url') or '').strip() or None
+            brief = str(entry.get('micro_project_brief') or prev.get('micro_project_brief') or '').strip()
+            merged_skills.append({
+                'skill_name': sname,
+                'gap_type': 'true_skill_gap',
+                'micro_project_brief': brief,
+                'proof_url': proof_url,
+                'verified': is_verified,
+            })
+
+        for low, prev in existing_by_skill.items():
+            if low in seen_skills:
+                continue
+            if bool(prev.get('verified')):
+                seen_skills.add(low)
+                merged_skills.append({
+                    'skill_name': str(prev.get('skill_name') or '').strip(),
+                    'gap_type': str(prev.get('gap_type') or 'true_skill_gap'),
+                    'micro_project_brief': str(prev.get('micro_project_brief') or '').strip(),
+                    'proof_url': str(prev.get('proof_url') or '').strip() or None,
+                    'verified': True,
+                })
+
+        merged_skills = merged_skills[:10]
+        wording_gaps = wording_gaps[:10]
+        schema_artifact = _build_schema_gap_artifact(job.get('id') or '', wording_gaps, merged_skills)
+        result = GapAnalysisResult(
+            wording_gaps=schema_artifact['wording_gaps'],
+            skill_gaps=schema_artifact['skill_gaps'],
+        )
+        return {
+            'result': result,
+            'wording_gaps': result.wording_gaps,
+            'skill_gaps': merged_skills,
+            'schema_artifact': schema_artifact,
+            'matched_keywords': det['matched_keywords'],
+            'fit_score': det['fit_score'],
+            'generation_mode': generation_mode,
+            'provider': provider,
+            'model': model,
+        }
+
+
+class CallbackCheatSheetBuilder:
+    """D2 30-Second Callback Cheat Sheet builder uniting diffs, answers, proof projects, and probe questions."""
+
+    def __init__(self, model_adapter: Optional[UnifiedModelAdapter] = None):
+        self.model_adapter = model_adapter
+
+    def build(
+        self,
+        job: Mapping[str, Any],
+        master_resume: str,
+        tailored_resume: str,
+        existing_cb: Optional[Mapping[str, Any]] = None,
+        candidate_answers: Optional[Mapping[str, Any]] = None,
+        verified_gap_proofs: Sequence[Mapping[str, Any]] = (),
+        changes: Optional[Sequence[Mapping[str, Any]]] = None,
+        resume_sha256: Optional[str] = None,
+        answers_sha256: Optional[str] = None,
+        confirmation_reference: Optional[str] = None,
+        submitted_at: Optional[str] = None,
+        generation_mode: Optional[str] = None,
+        mode: str = 'heuristic',
+    ) -> dict[str, Any]:
+        prev = dict(existing_cb) if isinstance(existing_cb, Mapping) else {}
+        tailored_text = str(tailored_resume or master_resume or '').strip()
+        master_text = str(master_resume or tailored_text).strip()
+
+        clean_proofs = [
+            {
+                'skill_name': str(p.get('skill_name') or '').strip(),
+                'proof_url': str(p.get('proof_url') or '').strip(),
+                'micro_project_brief': str(p.get('micro_project_brief') or '').strip(),
+            }
+            for p in (verified_gap_proofs or ())
+            if str(p.get('skill_name') or '').strip()
+        ]
+
+        # Build diff_summary from explicit tailor changes or difflib comparison vs master resume
+        raw_changes = changes if changes else (prev.get('tailor_changes') or prev.get('diff_summary') or [])
+        diff_summary: list[dict[str, str]] = []
+        if isinstance(raw_changes, list):
+            for ch in raw_changes:
+                if not isinstance(ch, Mapping):
+                    continue
+                orig = str(ch.get('original') or '').strip()
+                edited = str(ch.get('edited') or '').strip()
+                summary = str(ch.get('summary') or ch.get('reason') or '').strip()
+                if not (orig or edited or summary):
+                    continue
+                diff_summary.append({
+                    'change_type': str(ch.get('change_type') or 'tailor_edit'),
+                    'original': orig,
+                    'edited': edited,
+                    'summary': summary or (f'{orig[:60]} -> {edited[:60]}' if orig else edited[:100]),
+                })
+                if len(diff_summary) >= 6:
+                    break
+        if not diff_summary:
+            diff_summary = engine.summarize_resume_diff(master_text, tailored_text, limit=5)
+
+        prev_answers = prev.get('submitted_answers') if isinstance(prev.get('submitted_answers'), Mapping) else {}
+        merged_answers = {
+            **{str(k): v for k, v in prev_answers.items()},
+            **{str(k): v for k, v in (candidate_answers or {}).items()},
+        }
+
+        fit = compute_job_fit_snapshot(tailored_text, job)
+        shared = list(dict.fromkeys([*(prev.get('shared_keywords') or []), *(fit.get('matched') or [])]))[:12]
+
+        why_this_role = str(
+            merged_answers.get('why_company_and_role')
+            or prev.get('why_this_role')
+            or ''
+        ).strip()
+        if not why_this_role:
+            company = str(job.get('company') or 'this team').strip()
+            title = str(job.get('title') or 'this role').strip()
+            if shared:
+                why_this_role = (
+                    f"Direct hands-on match on {', '.join(shared[:5])} aligns candidate experience with "
+                    f"{title} at {company}."
+                )
+            else:
+                why_this_role = f"Candidate reviewed verified qualifications tailored for {title} at {company}."
+
+        probe_questions = [
+            str(q).strip() for q in (prev.get('probe_questions') or []) if str(q or '').strip()
+        ][:3]
+        if len(probe_questions) < 3:
+            probe_questions = engine.generate_probe_questions(
+                master_text,
+                tailored_text,
+                job,
+                verified_gap_proofs=clean_proofs,
+            )
+
+        chosen_mode = str(mode or 'heuristic').strip().lower()
+        effective_mode = str(generation_mode or prev.get('callback_generation_mode') or 'deterministic')
+        if chosen_mode in ('auto', 'llm'):
+            adapter = self.model_adapter or UnifiedModelAdapter()
+            llm_ready = True
+            if chosen_mode == 'auto':
+                try:
+                    adapter.resolve_provider_and_key()
+                except ModelNotConfiguredError:
+                    llm_ready = False
+            if llm_ready:
+                user_data = '\n\n'.join([
+                    'Task: Write a crisp 2-sentence why_this_role anchored ONLY in verified resume facts + verified_gap_proofs, '
+                    'and 3 likely deep-dive interviewer probe_questions tied to highlighted bullets or gap proofs.',
+                    _wrap_untrusted('tailored_resume', tailored_text),
+                    _wrap_untrusted('job_posting', f"Title: {job.get('title', '')}\nCompany: {job.get('company', '')}\nDescription: {job.get('description', '')}"),
+                    _wrap_untrusted('verified_gap_proofs', json.dumps(clean_proofs, ensure_ascii=False)),
+                ])
+                llm_out = adapter.generate_from_prompt(
+                    'resume_tailor_prompt',
+                    user_data,
+                    output_schema=_CALLBACK_OUTPUT_SCHEMA,
+                    include_system_guardrails=True,
+                )
+                if isinstance(llm_out, Mapping):
+                    llm_why = str(llm_out.get('why_this_role') or '').strip()
+                    llm_probes = _dedupe_strs(llm_out.get('probe_questions') or [], limit=3)
+                    if llm_why:
+                        why_this_role = llm_why
+                    if llm_probes:
+                        probe_questions = llm_probes[:3]
+                effective_mode = 'llm'
+
+        url = str(job.get('url') or prev.get('job_url') or '').strip()
+        ats_family = str(job.get('ats_family') or prev.get('ats_family') or engine.detect_ats_family(url) or 'unknown')
+        out = {
+            **prev,
+            'job_id': int(job.get('id') or prev.get('job_id') or 0),
+            'job_title': str(job.get('title') or prev.get('job_title') or ''),
+            'company': str(job.get('company') or prev.get('company') or ''),
+            'job_url': url,
+            'ats_family': ats_family,
+            'why_this_role': why_this_role,
+            'diff_summary': diff_summary,
+            'submitted_answers': merged_answers,
+            'probe_questions': probe_questions[:3],
+            'verified_gap_proofs': clean_proofs,
+            'shared_keywords': shared,
+            'resume_sha256': resume_sha256 or prev.get('resume_sha256') or compute_sha256_text(tailored_text),
+            'answers_sha256': answers_sha256 or prev.get('answers_sha256') or '',
+            'confirmation_reference': confirmation_reference or prev.get('confirmation_reference') or '',
+            'submitted_at': submitted_at or prev.get('submitted_at') or '',
+            'callback_generation_mode': effective_mode,
+            'updated_at': datetime.now(timezone.utc).isoformat(),
+        }
+        return out
+
+
+def build_callback_packet(
+    job: Mapping[str, Any],
+    master_resume: str,
+    tailored_resume: str,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Module-level convenience wrapper around CallbackCheatSheetBuilder().build(...)."""
+    return CallbackCheatSheetBuilder().build(job, master_resume, tailored_resume, **kwargs)
 
 
