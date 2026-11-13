@@ -1,6 +1,7 @@
 import base64
 import io
 import json
+import socket
 import tempfile
 import unittest
 import urllib.error
@@ -441,6 +442,1740 @@ class PipelineRouteTests(unittest.TestCase):
             self.assertIn('error', err)
 
         self.assertEqual(routes_pipeline.handle_post('/api/pipeline/gaps', {})[0], 501)
+
+
+import json
+import socket
+import tempfile
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from unittest import mock
+from urllib import error as urllib_error
+
+from app import db, engine, routes_pipeline
+from app.adapters_pipeline import (
+    JobDiscoveryError,
+    LiveJobDiscoveryAdapter,
+    _validate_against_schema,
+    normalize_job_url,
+    parse_board_spec,
+)
+
+
+def _fake_public_getaddrinfo(host, port, *args, **kwargs):
+    if host in ('127.0.0.1', 'localhost', '::1') or str(host).startswith(('10.', '192.168.')):
+        ip = '127.0.0.1' if host in ('127.0.0.1', 'localhost') else ('::1' if host == '::1' else str(host))
+        family = socket.AF_INET6 if ':' in ip else socket.AF_INET
+        return [(family, socket.SOCK_STREAM, 6, '', (ip, 0))]
+    return [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('93.184.216.34', 0))]
+
+
+class JobExtractorAndPreflightTests(unittest.TestCase):
+    def setUp(self):
+        self._dns_patch = mock.patch.object(socket, 'getaddrinfo', side_effect=_fake_public_getaddrinfo)
+        self._dns_patch.start()
+
+    def tearDown(self):
+        self._dns_patch.stop()
+
+    def test_detect_ats_family_all_supported_domains(self):
+        cases = [
+            ('https://boards.greenhouse.io/acme/jobs/12345', 'greenhouse'),
+            ('https://job-boards.greenhouse.io/acme/jobs/67890', 'greenhouse'),
+            ('https://jobs.lever.co/beta/11111111-2222-3333-4444-555555555555', 'lever'),
+            ('https://jobs.ashbyhq.com/gamma/aaaa-bbbb-cccc', 'ashby'),
+            ('https://acme.wd5.myworkdayjobs.com/en-US/Careers/job/Seattle/Eng_R123', 'workday'),
+            ('https://www.linkedin.com/jobs/view/123456789/', 'linkedin'),
+            ('https://www.indeed.com/viewjob?jk=abcdef1234', 'indeed'),
+            ('https://careers.example-corp.org/roles/backend-engineer', 'company_site'),
+            ('not-a-url', 'unknown'),
+        ]
+        for url, expected in cases:
+            self.assertEqual(engine.detect_ats_family(url), expected, msg=f'URL failed: {url}')
+
+    def test_inspect_public_job_url_greenhouse_lever_ashby_mocked(self):
+        gh_url = 'https://boards.greenhouse.io/acme/jobs/4242'
+        lever_url = 'https://jobs.lever.co/beta/11112222-3333-4444-5555-666677778888'
+        ashby_url = 'https://jobs.ashbyhq.com/gamma/9999aaaa-bbbb-cccc'
+
+        def fake_get(url: str, _accept: str, _timeout: float):
+            if url == 'https://boards-api.greenhouse.io/v1/boards/acme/jobs/4242?content=true':
+                body = {
+                    'title': 'Platform Solutions Engineer',
+                    'company_name': 'Acme Cloud',
+                    'content': '<p>Design scalable enterprise API integrations using Python and SQL across cloud tenants.</p>',
+                    'location': {'name': 'Remote - US'},
+                    'first_published': '2026-11-01T10:00:00Z',
+                    'absolute_url': gh_url,
+                }
+                return 200, {'content-type': 'application/json'}, json.dumps(body).encode('utf-8')
+            if url == 'https://api.lever.co/v0/postings/beta/11112222-3333-4444-5555-666677778888':
+                body = {
+                    'text': 'Forward Deployed Engineer',
+                    'categories': {'location': 'New York, NY'},
+                    'descriptionPlain': 'Partner with customers to integrate distributed telemetry pipelines and cloud SDKs.',
+                    'lists': [{'text': 'Requirements', 'content': '<li>Python &amp; REST APIs</li>'}],
+                    'salaryRange': {'min': 140000, 'max': 175000, 'currency': 'USD', 'interval': 'per-year-salary'},
+                    'createdAt': 1793500000000,
+                    'hostedUrl': lever_url,
+                }
+                return 200, {'content-type': 'application/json'}, json.dumps(body).encode('utf-8')
+            if url == 'https://api.ashbyhq.com/posting-api/job-board/gamma?includeCompensation=true':
+                body = {
+                    'jobs': [{
+                        'id': '9999aaaa-bbbb-cccc',
+                        'title': 'Applied AI Engineer',
+                        'location': 'San Francisco, CA',
+                        'descriptionPlain': 'Build evaluation harnesses and reliable structured-output agents for customer workflows.',
+                        'compensation': {'compensationTierSummary': '$160K - $200K'},
+                        'publishedAt': '2026-11-05T12:00:00Z',
+                        'jobUrl': ashby_url,
+                    }]
+                }
+                return 200, {'content-type': 'application/json'}, json.dumps(body).encode('utf-8')
+            return 404, {}, b'{}'
+
+        gh = engine.inspect_public_job_url(gh_url, http_get=fake_get)
+        self.assertEqual(gh['extraction'], 'greenhouse-public-api')
+        self.assertEqual(gh['company'], 'Acme Cloud')
+        self.assertEqual(gh['location'], 'Remote - US')
+        self.assertEqual(gh['ats_family'], 'greenhouse')
+
+        lv = engine.inspect_public_job_url(lever_url, http_get=fake_get)
+        self.assertEqual(lv['extraction'], 'lever-public-api')
+        self.assertEqual(lv['location'], 'New York, NY')
+        self.assertEqual(lv['salary_text'], 'USD 140000-175000 per-year-salary')
+        self.assertEqual(lv['ats_family'], 'lever')
+
+        ab = engine.inspect_public_job_url(ashby_url, http_get=fake_get)
+        self.assertEqual(ab['extraction'], 'ashby-public-api')
+        self.assertEqual(ab['salary_text'], '$160K - $200K')
+        self.assertEqual(ab['ats_family'], 'ashby')
+
+    def test_inspect_public_job_url_json_ld_and_honest_manual_fallbacks(self):
+        jsonld_html = """<!doctype html><html><head>
+        <script type="application/ld+json">{
+          "@context": "https://schema.org",
+          "@type": "JobPosting",
+          "title": "Cloud Security Engineer",
+          "datePosted": "2026-11-02",
+          "validThrough": "2026-12-31T23:59:59Z",
+          "hiringOrganization": {"@type": "Organization", "name": "Northstar Defense"},
+          "jobLocationType": "TELECOMMUTE",
+          "jobLocation": {"@type": "Place", "address": {"addressLocality": "Austin", "addressRegion": "TX", "addressCountry": "US"}},
+          "baseSalary": {"@type": "MonetaryAmount", "currency": "USD", "value": {"@type": "QuantitativeValue", "minValue": 150000, "maxValue": 185000, "unitText": "YEAR"}},
+          "description": "<p>Harden Kubernetes clusters, automate IAM policies, and build CI security scanners.</p>"
+        }</script></head><body><h1>Cloud Security Engineer</h1></body></html>"""
+
+        workday_shell = '<html><body><div id="root"></div><script>window.__workday={};</script>Sign In Required Please enable JavaScript</body></html>'
+
+        def fake_get(url: str, _accept: str, _timeout: float):
+            if 'northstar' in url:
+                return 200, {'content-type': 'text/html', '__final_url__': url}, jsonld_html.encode('utf-8')
+            if 'linkedin.com' in url:
+                return 999, {'content-type': 'text/html', '__final_url__': url}, b'Request denied'
+            if 'indeed.com' in url:
+                return 403, {'content-type': 'text/html', '__final_url__': url}, b'Cloudflare'
+            if 'myworkdayjobs.com' in url:
+                return 200, {'content-type': 'text/html', '__final_url__': url}, workday_shell.encode('utf-8')
+            if 'timeout' in url:
+                raise urllib_error.URLError('timed out')
+            return 200, {'content-type': 'text/html', '__final_url__': 'https://example.org/login?next=/job'}, b'Sign in'
+
+        ok = engine.inspect_public_job_url('https://careers.northstar.example/jobs/1', http_get=fake_get)
+        self.assertEqual(ok['extraction_status'], 'verified')
+        self.assertEqual(ok['company'], 'Northstar Defense')
+        self.assertIn('Austin, TX', ok['location'])
+        self.assertIn('Remote', ok['location'])
+        self.assertEqual(ok['salary_text'], 'USD 150000-185000 YEAR')
+        self.assertEqual(ok['posted_at'], '2026-11-02')
+        self.assertEqual(ok['valid_through'], '2026-12-31T23:59:59Z')
+
+        for blocked_url, expected_ats in [
+            ('https://www.linkedin.com/jobs/view/987654/', 'linkedin'),
+            ('https://www.indeed.com/viewjob?jk=xyz', 'indeed'),
+            ('https://acme.wd1.myworkdayjobs.com/en-US/Ext/job/R1', 'workday'),
+            ('https://careers.redirected.example/role/1', 'company_site'),
+            ('https://timeout.example/job/1', 'company_site'),
+        ]:
+            res = engine.inspect_public_job_url(blocked_url, http_get=fake_get)
+            self.assertEqual(res['extraction_status'], 'manual_fallback', msg=blocked_url)
+            self.assertTrue(res['fallback_required'])
+            self.assertEqual(res['ats_family'], expected_ats)
+
+        with self.assertRaises(ValueError):
+            engine.inspect_public_job_url('http://127.0.0.1:8080/internal-job', http_get=fake_get)
+
+    def test_evaluate_preflight_rules_and_schema_strictness(self):
+        now = datetime(2026, 11, 13, 12, 0, tzinfo=timezone.utc)
+        fresh = engine.evaluate_preflight(
+            {
+                'title': 'Platform Engineer',
+                'description': 'Build reliable Python services on Kubernetes with strong test coverage.',
+                'url': 'https://jobs.lever.co/acme/123',
+                'posted_at': (now - timedelta(days=5)).isoformat(),
+            },
+            now=now,
+        )
+        self.assertEqual(fresh['ats_family'], 'lever')
+        self.assertEqual(fresh['liveness_status'], 'active')
+        self.assertEqual(fresh['scam_risk'], 'low')
+        self.assertEqual(fresh['friction_roi'], 'high_roi_low_bot_noise')
+
+        stale = engine.evaluate_preflight(
+            {
+                'title': 'Backend Developer',
+                'description': 'Apply fast via Easy Apply with your resume.',
+                'url': 'https://www.linkedin.com/jobs/view/555',
+                'posted_at': (now - timedelta(days=45)).isoformat(),
+            },
+            now=now,
+        )
+        self.assertEqual(stale['liveness_status'], 'stale_risk')
+        self.assertEqual(stale['friction_roi'], 'saturated_easy_apply')
+
+        closed = engine.evaluate_preflight(
+            {
+                'title': 'Data Scientist',
+                'description': 'This job is no longer accepting applications.',
+                'url': 'https://boards.greenhouse.io/foo/jobs/99',
+                'posted_at': (now - timedelta(days=2)).isoformat(),
+            },
+            now=now,
+        )
+        self.assertEqual(closed['liveness_status'], 'closed')
+        self.assertEqual(closed['friction_roi'], 'high_risk')
+
+        scammy = engine.evaluate_preflight(
+            {
+                'title': 'Urgent Remote Data Entry',
+                'description': (
+                    'Interview via Telegram @recruiter, provide manager references upfront, '
+                    'wire transfer for training equipment, and npm install https://evil.example/takehome.tgz'
+                ),
+                'url': 'https://careers.shady.example/job',
+            },
+            now=now,
+        )
+        self.assertEqual(scammy['scam_risk'], 'high')
+        self.assertEqual(scammy['friction_roi'], 'high_risk')
+        self.assertIn('off_platform_messaging_pivot', scammy['scam_flags'])
+        self.assertIn('upfront_reference_harvesting', scammy['scam_flags'])
+        self.assertIn('pre_offer_sensitive_pii_or_payment', scammy['scam_flags'])
+        self.assertIn('untrusted_takehome_or_malware_download', scammy['scam_flags'])
+
+        # Validate strict storage shape against schemas/job.schema.json#properties.preflight
+        schema = json.loads((Path(__file__).resolve().parents[1] / 'schemas' / 'job.schema.json').read_text())
+        preflight_schema = schema['properties']['preflight']
+        allowed_keys = set(preflight_schema['properties'].keys())
+        for sample in (fresh, stale, closed, scammy):
+            stored = engine.preflight_storage_dict(sample)
+            self.assertEqual(set(stored.keys()), allowed_keys)
+            self.assertNotIn('ats_family', stored)
+            self.assertEqual(_validate_against_schema(stored, preflight_schema), [])
+            self.assertIn(sample['ats_family'], schema['properties']['ats_family']['enum'])
+
+
+class JobDiscoveryAndRoutesTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._db_path = Path(self._tmp.name) / 'test_discovery.sqlite3'
+        self._patch = mock.patch.object(db, 'DB_PATH', self._db_path)
+        self._dns_patch = mock.patch.object(socket, 'getaddrinfo', side_effect=_fake_public_getaddrinfo)
+        self._patch.start()
+        self._dns_patch.start()
+        db.init_db()
+
+    def tearDown(self):
+        self._dns_patch.stop()
+        self._patch.stop()
+        self._tmp.cleanup()
+
+    def test_live_discovery_combines_ats_feeds_serper_dedupes_and_redacts_secrets(self):
+        shared_url = 'https://boards.greenhouse.io/acme/jobs/1001'
+
+        def fake_get(url: str, _accept: str, _timeout: float):
+            if url == 'https://boards-api.greenhouse.io/v1/boards/acme/jobs?content=true':
+                body = {
+                    'jobs': [
+                        {
+                            'title': 'Solutions Engineer',
+                            'company_name': 'Acme AI',
+                            'content': '<p>Help enterprise customers build API integrations in Python across Remote teams.</p>',
+                            'location': {'name': 'Remote - US'},
+                            'first_published': '2026-11-10T10:00:00Z',
+                            'absolute_url': shared_url + '?utm_source=feed',
+                        },
+                        {
+                            'title': 'Office Chef',
+                            'company_name': 'Acme AI',
+                            'content': '<p>Prepare daily lunches in headquarters.</p>',
+                            'location': {'name': 'Austin, TX'},
+                            'first_published': '2026-11-10T10:00:00Z',
+                            'absolute_url': 'https://boards.greenhouse.io/acme/jobs/1002',
+                        },
+                    ]
+                }
+                return 200, {'content-type': 'application/json'}, json.dumps(body).encode('utf-8')
+            if url == 'https://api.lever.co/v0/postings/beta?mode=json':
+                body = [{
+                    'text': 'Forward Deployed Solutions Engineer',
+                    'categories': {'location': 'Remote'},
+                    'descriptionPlain': 'Architect Python and SQL customer deployments.',
+                    'salaryRange': {'min': 130000, 'max': 160000, 'currency': 'USD', 'interval': 'per-year-salary'},
+                    'createdAt': 1794000000000,
+                    'hostedUrl': 'https://jobs.lever.co/beta/lever-uuid-1',
+                }]
+                return 200, {'content-type': 'application/json'}, json.dumps(body).encode('utf-8')
+            if url == 'https://api.ashbyhq.com/posting-api/job-board/gamma?includeCompensation=true':
+                body = {
+                    'jobs': [{
+                        'id': 'ashby-1',
+                        'title': 'Customer Solutions Architect',
+                        'location': 'Remote (North America)',
+                        'descriptionPlain': 'Partner with enterprise engineering teams on Python SDKs.',
+                        'compensation': {'compensationTierSummary': '$155K - $185K'},
+                        'publishedAt': '2026-11-11T09:00:00Z',
+                        'jobUrl': 'https://jobs.ashbyhq.com/gamma/ashby-1',
+                        'isListed': True,
+                    }]
+                }
+                return 200, {'content-type': 'application/json'}, json.dumps(body).encode('utf-8')
+            if url == 'https://www.linkedin.com/jobs/view/777888':
+                return 999, {'content-type': 'text/html', '__final_url__': url}, b'blocked'
+            return 404, {}, b'{}'
+
+        def fake_serper(_url: str, headers: dict, payload: dict, _timeout: float):
+            self.assertEqual(headers['X-API-KEY'], 'serper-secret-token-xyz123')
+            self.assertIn('Solutions', payload['q'])
+            return {
+                'organic': [
+                    # Duplicate of Greenhouse role with tracking param — should dedupe!
+                    {
+                        'title': 'Solutions Engineer - Acme AI',
+                        'link': shared_url + '?gh_src=google',
+                        'snippet': 'Join Acme AI as Solutions Engineer.',
+                    },
+                    {
+                        'title': 'Enterprise Solutions Engineer - Northwind',
+                        'link': 'https://www.linkedin.com/jobs/view/777888',
+                        'snippet': 'Remote customer engineering role using Python and cloud APIs.',
+                    },
+                ]
+            }
+
+        adapter = LiveJobDiscoveryAdapter(
+            environ={'SEARCH_API_KEY': 'serper-secret-token-xyz123'},
+            http_get=fake_get,
+            serper_post=fake_serper,
+        )
+        results = adapter.search({
+            'query': 'Solutions',
+            'location': 'Remote',
+            'boards': ['greenhouse:acme', 'lever:beta', 'ashby:gamma'],
+            'limit': 10,
+        })
+
+        # Should include Greenhouse Acme, Lever Beta, Ashby Gamma, and LinkedIn Northwind (deduped Acme Serper hit!)
+        self.assertEqual(len(results), 4)
+        titles = [r['title'] for r in results]
+        self.assertIn('Solutions Engineer', titles)
+        self.assertNotIn('Office Chef', titles)
+        linkedin_hit = next(r for r in results if r['ats_family'] == 'linkedin')
+        self.assertEqual(linkedin_hit['extraction_status'], 'manual_fallback')
+        self.assertEqual(linkedin_hit['preflight']['friction_roi'], 'saturated_easy_apply')
+        self.assertEqual(len({normalize_job_url(r['url']) for r in results}), 4)
+
+        # Ensure Serper secret is redacted if upstream throws an error containing the key
+        def failing_serper(*_args):
+            raise RuntimeError('Auth failed with key serper-secret-token-xyz123')
+
+        failing_adapter = LiveJobDiscoveryAdapter(
+            environ={'SEARCH_API_KEY': 'serper-secret-token-xyz123'},
+            http_get=fake_get,
+            serper_post=failing_serper,
+        )
+        _ = failing_adapter.search({'query': 'Solutions', 'boards': []})
+        self.assertNotIn('serper-secret-token-xyz123', failing_adapter.last_metadata['serper_error'])
+        self.assertIn('[REDACTED]', failing_adapter.last_metadata['serper_error'])
+
+    def test_parse_board_spec_validation_and_normalize_url(self):
+        self.assertEqual(parse_board_spec('lever:figma'), ('lever', 'figma'))
+        self.assertEqual(parse_board_spec('stripe'), ('greenhouse', 'stripe'))
+        with self.assertRaises(JobDiscoveryError):
+            parse_board_spec('workday:acme')
+        with self.assertRaises(JobDiscoveryError):
+            parse_board_spec('greenhouse:../evil')
+        self.assertEqual(
+            normalize_job_url('HTTPS://Boards.Greenhouse.io/acme/jobs/1/?utm_source=li&gh_src=x#apply'),
+            'https://boards.greenhouse.io/acme/jobs/1',
+        )
+
+    def test_discovery_import_and_preflight_routes_and_seeded_jobs(self):
+        # db.init_db() seeds sample_data/fictional_jobs.json into empty DB automatically
+        fictional = json.loads((Path(__file__).resolve().parents[1] / 'sample_data' / 'fictional_jobs.json').read_text())
+
+        # Check status endpoint includes A-02 discovery_adapter and no secret leakage
+        code_status, body_status = routes_pipeline.handle_get('/api/pipeline/status')
+        self.assertEqual(code_status, 200)
+        self.assertIn('A-02', body_status['tasks_completed'])
+        self.assertIn('discovery_adapter', body_status)
+
+        # Run preflight-all across all seeded fictional jobs
+        code_all, body_all = routes_pipeline.handle_post('/api/pipeline/jobs/preflight-all', {})
+        self.assertEqual(code_all, 200)
+        self.assertEqual(body_all['evaluated_count'], len(fictional))
+        for item in body_all['jobs']:
+            self.assertIn('preflight', item)
+            self.assertIn('liveness_status', item['preflight'])
+            self.assertIn(item['ats_family'], engine.VALID_ATS_FAMILIES)
+
+        # Single job preflight endpoint + 404 check
+        first_id = body_all['jobs'][0]['id']
+        code_one, body_one = routes_pipeline.handle_post(f'/api/pipeline/jobs/{first_id}/preflight', {})
+        self.assertEqual(code_one, 200)
+        self.assertEqual(body_one['job_id'], first_id)
+        code_missing, _ = routes_pipeline.handle_post('/api/pipeline/jobs/999999/preflight', {})
+        self.assertEqual(code_missing, 404)
+
+        # Import-url manual fallback + manual_paste persistence
+        with mock.patch.object(
+            engine,
+            'inspect_public_job_url',
+            return_value={
+                'title': '',
+                'company': '',
+                'description': '',
+                'location': '',
+                'salary_text': '',
+                'posted_at': '',
+                'valid_through': '',
+                'url': 'https://www.linkedin.com/jobs/view/321',
+                'ats_family': 'linkedin',
+                'extraction': 'manual-fallback',
+                'extraction_status': 'manual_fallback',
+                'fallback_required': True,
+                'reason': 'Blocked HTTP 999',
+            },
+        ):
+            code_fb, body_fb = routes_pipeline.handle_post(
+                '/api/pipeline/jobs/import-url',
+                {'url': 'https://www.linkedin.com/jobs/view/321'},
+            )
+            self.assertEqual(code_fb, 200)
+            self.assertTrue(body_fb['manual_fallback'])
+            self.assertFalse(body_fb['saved'])
+
+        code_paste, body_paste = routes_pipeline.handle_post(
+            '/api/pipeline/jobs/import-url',
+            {
+                'url': 'https://www.linkedin.com/jobs/view/321',
+                'manual_paste': True,
+                'title': 'Partner Solutions Architect',
+                'company': 'Contoso',
+                'description': 'Design cloud architectures, Python microservices, and customer demos for enterprise clients.',
+            },
+        )
+        self.assertEqual(code_paste, 200)
+        self.assertTrue(body_paste['saved'])
+        self.assertEqual(body_paste['job']['ats_family'], 'linkedin')
+
+        # Discover route saves & deduplicates against DB
+        mock_discovered = [{
+            'title': 'API Platform Engineer',
+            'company': 'Delta Labs',
+            'description': 'Build distributed Python REST services.',
+            'location': 'Remote',
+            'salary_text': '$150,000',
+            'posted_at': '2026-11-11T00:00:00Z',
+            'url': 'https://boards.greenhouse.io/delta/jobs/55',
+            'ats_family': 'greenhouse',
+            'origin': 'discovered',
+            'extraction_status': 'verified',
+            'source_provider': 'greenhouse:delta',
+            'preflight': {
+                'liveness_status': 'active',
+                'scam_risk': 'low',
+                'scam_flags': [],
+                'friction_roi': 'high_roi_low_bot_noise',
+                'notes': 'ATS=greenhouse Fresh posting.',
+            },
+        }]
+        fake_adapter = mock.MagicMock()
+        fake_adapter.search.return_value = mock_discovered
+        fake_adapter.last_metadata = {'sources_queried': ['greenhouse:delta'], 'deduped_count': 1}
+        with mock.patch.object(routes_pipeline, '_get_discovery_adapter', return_value=fake_adapter):
+            code_disc1, body_disc1 = routes_pipeline.handle_post(
+                '/api/pipeline/jobs/discover',
+                {'query': 'Platform Engineer', 'boards': ['greenhouse:delta']},
+            )
+            self.assertEqual(code_disc1, 200)
+            self.assertEqual(body_disc1['inserted_count'], 1)
+
+            # Calling discover again with same job should deduplicate instead of double-inserting
+            code_disc2, body_disc2 = routes_pipeline.handle_post(
+                '/api/pipeline/jobs/discover',
+                {'query': 'Platform Engineer', 'boards': ['greenhouse:delta']},
+            )
+            self.assertEqual(code_disc2, 200)
+            self.assertEqual(body_disc2['inserted_count'], 0)
+            self.assertEqual(body_disc2['duplicate_count'], 1)
+
+        # Ensure unimplemented Owner A routes still return 501
+        code_501, _ = routes_pipeline.handle_post('/api/pipeline/gaps', {})
+        self.assertEqual(code_501, 501)
+
+
+from app.adapters_pipeline import (
+    ApplicationError,
+    CoPilotApplicationAdapter,
+    SENSITIVE_FIELDS,
+    compute_answers_sha256,
+    compute_sha256_text,
+    extract_contact_hints,
+    is_fictional_job,
+)
+
+
+class CoPilotApplicationAndReceiptTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._db_path = Path(self._tmp.name) / 'test_copilot.sqlite3'
+        self._patch = mock.patch.object(db, 'DB_PATH', self._db_path)
+        self._patch.start()
+        db.init_db()
+
+    def tearDown(self):
+        self._patch.stop()
+        self._tmp.cleanup()
+
+    def _valid_sensitive_answers(self):
+        return {
+            'work_authorization': 'Authorized to work in the US without sponsorship',
+            'visa_sponsorship': 'No',
+            'salary_expectation': 'Negotiable ($140k-$165k)',
+            'veteran_status': 'Decline to self-identify',
+            'disability_status': 'Decline to self-identify',
+            'references': 'Available upon request',
+        }
+
+    def test_copilot_packet_ordering_conservative_hints_and_sensitive_locks(self):
+        resume_with_contact = (
+            'Jordan Taylor\n'
+            'jordan.taylor@example.org | (512) 555-0199\n'
+            'https://linkedin.com/in/jordantaylor | https://github.com/jordantaylor\n'
+            '- 2023-2026: Built Python and SQL cloud APIs at Northwind Systems.'
+        )
+        adapter = CoPilotApplicationAdapter()
+        workday_packet = adapter.prepare(
+            {
+                'id': 10,
+                'title': 'Platform Engineer',
+                'company': 'Contoso',
+                'description': 'Build reliable Python microservices and SQL data pipelines.',
+                'url': 'https://contoso.wd5.myworkdayjobs.com/en-US/Careers/job/R99',
+            },
+            {'resume': resume_with_contact},
+            resume_with_contact,
+        )
+        self.assertEqual(workday_packet.ats_family, 'workday')
+        section_ids = [s['section_id'] for s in workday_packet.ordered_sections]
+        self.assertEqual(section_ids[0], 'portal_preflight')
+        self.assertEqual(section_ids[-1], 'sensitive_eligibility_locked')
+
+        locked_sec = workday_packet.ordered_sections[-1]
+        self.assertTrue(locked_sec['locked'])
+        self.assertFalse(locked_sec['ai_generated'])
+        self.assertEqual([f['key'] for f in locked_sec['fields']], list(SENSITIVE_FIELDS))
+        self.assertTrue(all(f['value'] == '' for f in locked_sec['fields']))
+
+        # No invented contact details when absent from resume
+        minimal_hints = extract_contact_hints('Experienced engineer delivering scalable APIs.')
+        self.assertEqual(minimal_hints['email'], '')
+        self.assertEqual(minimal_hints['phone'], '')
+        self.assertEqual(minimal_hints['linkedin_url'], '')
+
+    def test_adapter_consent_sensitive_fictional_and_evidence_gates(self):
+        adapter = CoPilotApplicationAdapter()
+        resume = 'Alex Rivera - Senior Backend Engineer with 6 years building Python APIs and SQL systems.'
+        real_job = {
+            'id': 20,
+            'title': 'Senior Backend Engineer',
+            'company': 'Acme Cloud',
+            'origin': 'imported_url',
+            'url': 'https://boards.greenhouse.io/acme/jobs/777',
+        }
+        base_payload = {
+            'job': real_job,
+            'approved_resume': resume,
+            'candidate_answers': {'full_name': 'Alex Rivera', 'why_company_and_role': 'Excited about distributed systems.'},
+            'sensitive_answers': self._valid_sensitive_answers(),
+            'sensitive_fields_confirmed': True,
+            'outcome': 'confirmed',
+            'confirmation_reference': 'GH-94821-CONF',
+        }
+
+        with self.assertRaises(PermissionError):
+            adapter.submit(base_payload, explicit_user_approval=False)
+
+        with self.assertRaises(ApplicationError):
+            adapter.submit({**base_payload, 'sensitive_fields_confirmed': False}, explicit_user_approval=True)
+
+        bad_sens = dict(self._valid_sensitive_answers())
+        bad_sens['work_authorization'] = 'TBD'
+        with self.assertRaises(ApplicationError):
+            adapter.submit({**base_payload, 'sensitive_answers': bad_sens}, explicit_user_approval=True)
+
+        with self.assertRaises(ApplicationError):
+            adapter.submit({**base_payload, 'confirmation_reference': ''}, explicit_user_approval=True)
+
+        self.assertTrue(is_fictional_job({'origin': 'fictional-sample', 'url': 'https://example.com/jobs/1'}))
+        with self.assertRaises(ApplicationError):
+            adapter.submit(
+                {**base_payload, 'job': {'origin': 'fictional-sample', 'url': 'https://example.com/jobs/1'}},
+                explicit_user_approval=True,
+            )
+
+        manual_res = adapter.submit(
+            {**base_payload, 'outcome': 'manual_required', 'confirmation_reference': ''},
+            explicit_user_approval=True,
+        )
+        self.assertEqual(manual_res.status, 'manual_required')
+        self.assertIsNone(manual_res.confirmation_id)
+
+        ok_res = adapter.submit(base_payload, explicit_user_approval=True)
+        self.assertEqual(ok_res.status, 'confirmed')
+        self.assertEqual(ok_res.confirmation_id, 'GH-94821-CONF')
+        self.assertEqual(ok_res.resume_sha256, compute_sha256_text(resume))
+        self.assertEqual(len(ok_res.answers_sha256), 64)
+
+    def test_copilot_routes_receipts_duplicate_block_and_test_isolation(self):
+        # Status reports A-03
+        code_status, body_status = routes_pipeline.handle_get('/api/pipeline/status')
+        self.assertEqual(code_status, 200)
+        self.assertIn('A-03', body_status['tasks_completed'])
+        self.assertIn('application_adapter', body_status)
+
+        # Insert 2 real jobs pointing to same canonical URL (tracking param difference) + 1 real job for test_submitted check
+        with db.connection() as con:
+            j1_id = con.execute(
+                'INSERT INTO jobs(title, company, description, url, origin, ats_family) VALUES(?,?,?,?,?,?)',
+                (
+                    'Solutions Engineer',
+                    'Acme Cloud',
+                    'Architect Python REST integrations and cloud deployments.',
+                    'https://boards.greenhouse.io/acme/jobs/501',
+                    'imported_url',
+                    'greenhouse',
+                ),
+            ).lastrowid
+            j2_id = con.execute(
+                'INSERT INTO jobs(title, company, description, url, origin, ats_family) VALUES(?,?,?,?,?,?)',
+                (
+                    'Solutions Engineer (Mirror Link)',
+                    'Acme Cloud',
+                    'Architect Python REST integrations and cloud deployments.',
+                    'https://boards.greenhouse.io/acme/jobs/501?utm_source=linkedin',
+                    'discovered',
+                    'greenhouse',
+                ),
+            ).lastrowid
+            j3_id = con.execute(
+                'INSERT INTO jobs(title, company, description, url, origin, ats_family) VALUES(?,?,?,?,?,?)',
+                (
+                    'Customer Success Engineer',
+                    'Beta Corp',
+                    'Support enterprise API onboarding with Python and SQL.',
+                    'https://jobs.lever.co/beta/999',
+                    'imported_url',
+                    'lever',
+                ),
+            ).lastrowid
+
+        # Build Co-Pilot Packet directly for job 1
+        code_cp1, body_cp1 = routes_pipeline.handle_post(f'/api/pipeline/jobs/{j1_id}/copilot', {})
+        self.assertEqual(code_cp1, 200)
+        app1_id = body_cp1['application']['id']
+        self.assertEqual(body_cp1['copilot_packet']['ats_family'], 'greenhouse')
+
+        # Confirmation without explicit approval -> 403
+        code_403, _ = routes_pipeline.handle_post(
+            f'/api/pipeline/applications/{app1_id}/confirm',
+            {
+                'explicit_user_approval': False,
+                'sensitive_fields_confirmed': True,
+                'sensitive_answers': self._valid_sensitive_answers(),
+                'outcome': 'confirmed',
+                'confirmation_reference': 'GH-501',
+            },
+        )
+        self.assertEqual(code_403, 403)
+
+        # Fictional demo job #1 supports Co-Pilot preview but rejects real confirmed submission
+        code_demo_cp, body_demo_cp = routes_pipeline.handle_post('/api/pipeline/jobs/1/copilot', {})
+        self.assertEqual(code_demo_cp, 200)
+        code_demo_confirm, _ = routes_pipeline.handle_post(
+            f'/api/pipeline/applications/{body_demo_cp["application"]["id"]}/confirm',
+            {
+                'explicit_user_approval': True,
+                'sensitive_fields_confirmed': True,
+                'sensitive_answers': self._valid_sensitive_answers(),
+                'outcome': 'confirmed',
+                'confirmation_reference': 'FAKE-123',
+            },
+        )
+        self.assertEqual(code_demo_confirm, 400)
+
+        # Manual required preserves empty confirmation -> real_submitted count remains 0
+        code_man, body_man = routes_pipeline.handle_post(
+            f'/api/pipeline/applications/{app1_id}/confirm',
+            {
+                'explicit_user_approval': True,
+                'sensitive_fields_confirmed': True,
+                'sensitive_answers': self._valid_sensitive_answers(),
+                'outcome': 'manual_required',
+                'evidence_note': 'CAPTCHA challenge on portal; paused honestly.',
+            },
+        )
+        self.assertEqual(code_man, 200)
+        self.assertFalse(body_man['real_submitted_counted'])
+        self.assertEqual(
+            db.row("SELECT COUNT(*) AS n FROM applications WHERE status='confirmed' AND confirmation!=''")['n'],
+            0,
+        )
+
+        # Valid confirmation increments real_submitted to 1 and populates SHA-256 receipt
+        code_ok, body_ok = routes_pipeline.handle_post(
+            f'/api/pipeline/applications/{app1_id}/confirm',
+            {
+                'explicit_user_approval': True,
+                'sensitive_fields_confirmed': True,
+                'candidate_answers': {'full_name': 'Alex Rivera', 'why_company_and_role': 'Direct fit on REST APIs.'},
+                'sensitive_answers': self._valid_sensitive_answers(),
+                'outcome': 'confirmed',
+                'confirmation_reference': 'GH-CONF-501-XYZ',
+                'evidence_note': 'Received confirmation email.',
+                'evidence_path': 'screenshots/gh_501.png',
+            },
+        )
+        self.assertEqual(code_ok, 200)
+        self.assertTrue(body_ok['real_submitted_counted'])
+        self.assertEqual(body_ok['receipt']['confirmation_reference'], 'GH-CONF-501-XYZ')
+        self.assertEqual(
+            db.row("SELECT COUNT(*) AS n FROM applications WHERE status='confirmed' AND confirmation!=''")['n'],
+            1,
+        )
+
+        # Duplicate confirmed application via normalized mirror URL (j2_id) is blocked with 409
+        _, body_cp2 = routes_pipeline.handle_post(f'/api/pipeline/jobs/{j2_id}/copilot', {})
+        app2_id = body_cp2['application']['id']
+        code_dup, _ = routes_pipeline.handle_post(
+            f'/api/pipeline/applications/{app2_id}/confirm',
+            {
+                'explicit_user_approval': True,
+                'sensitive_fields_confirmed': True,
+                'sensitive_answers': self._valid_sensitive_answers(),
+                'outcome': 'confirmed',
+                'confirmation_reference': 'GH-CONF-501-DUP',
+            },
+        )
+        self.assertEqual(code_dup, 409)
+
+        # test_submitted application stays isolated and cannot be promoted to confirmed
+        with db.connection() as con:
+            app3_id = con.execute(
+                "INSERT INTO applications(job_id, tailored_resume, fit_score, status, confirmation) VALUES(?,?,?,'test_submitted',?)",
+                (j3_id, 'A' * 80, 75, 'DEMO ONLY - no job site contacted'),
+            ).lastrowid
+        code_iso, _ = routes_pipeline.handle_post(
+            f'/api/pipeline/applications/{app3_id}/confirm',
+            {
+                'explicit_user_approval': True,
+                'sensitive_fields_confirmed': True,
+                'sensitive_answers': self._valid_sensitive_answers(),
+                'outcome': 'confirmed',
+                'confirmation_reference': 'LEVER-999',
+            },
+        )
+        self.assertEqual(code_iso, 400)
+
+        # Audit log never stores raw sensitive answers (like $140k-$165k salary expectation)
+        audits = db.rows("SELECT details_json FROM audit_events WHERE action='application_confirmed'")
+        self.assertEqual(len(audits), 1)
+        self.assertNotIn('$140k-$165k', audits[0]['details_json'])
+        self.assertIn('GH-CONF-501-XYZ', audits[0]['details_json'])
+
+
+from app import engine
+from app.adapters import TailoredResumeResult
+from app.adapters_pipeline import VoicePreservingTailorAdapter, build_minimal_docx_bytes
+
+
+class AntiSlopTailorAndPreviewTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._db_path = Path(self._tmp.name) / 'test_tailor.sqlite3'
+        self._patch = mock.patch.object(db, 'DB_PATH', self._db_path)
+        self._patch.start()
+        db.init_db()
+        self.sample_resume = (
+            'Jordan Taylor\n'
+            'Seattle, WA | jordan.taylor@example.org\n'
+            'Skills: Python, SQL, REST APIs, Docker, Automated Testing\n'
+            'Experience:\n'
+            '- Software Engineer, Northwind Systems (2023-2026): Built Python REST APIs and SQL ETL jobs, '
+            'reducing nightly query runtime by 20% across 12 production tables.\n'
+            '- Engineering Intern, Fabrikam Cloud (2022-2023): Wrote integration tests in pytest and Containerized '
+            'CI checks with Docker.\n'
+        )
+        self.sample_job = {
+            'id': 1,
+            'title': 'Backend Software Engineer',
+            'company': 'Contoso Cloud',
+            'location': 'Seattle, WA',
+            'description': 'Build reliable Python microservices, SQL schemas, and Docker test harnesses.',
+            'requirements': 'Python, SQL, Docker, Kubernetes, REST APIs',
+            'url': 'https://boards.greenhouse.io/contoso/jobs/9001',
+        }
+
+    def tearDown(self):
+        self._patch.stop()
+        self._tmp.cleanup()
+
+    def test_lint_ai_slop_flags_buzzwords_and_allows_authentic_prose(self):
+        clean_report = engine.lint_ai_slop(self.sample_resume)
+        self.assertTrue(clean_report['clean'])
+        self.assertEqual(clean_report['slop_warnings'], [])
+        self.assertEqual(clean_report['slop_score'], 0)
+
+        sloppy = (
+            'Results-driven, passionate engineer who spearheaded and orchestrated synergy to '
+            'leverage cutting-edge paradigms seamlessly!'
+        )
+        dirty_report = engine.lint_ai_slop(sloppy)
+        self.assertFalse(dirty_report['clean'])
+        self.assertGreater(dirty_report['slop_score'], 0)
+        self.assertGreaterEqual(len(dirty_report['slop_warnings']), 3)
+        flagged_names = {item['term'] for item in dirty_report['flagged_terms']}
+        self.assertIn('spearheaded', flagged_names)
+        self.assertIn('leveraged', flagged_names)
+
+    def test_verify_tailor_grounding_flags_fabrications_and_allows_verified_gaps(self):
+        fabricated_resume = (
+            'Jordan Taylor\n'
+            'Skills: Python, SQL, Kubernetes, Terraform\n'
+            '- Software Engineer, Northwind Systems (2023-2026): Built Python REST APIs, reducing runtime by 95%.\n'
+        )
+        raw_claims = [
+            {'claim': 'Built Python REST APIs at Northwind Systems', 'source_snippet': 'Built Python REST APIs and SQL ETL jobs'},
+            {'claim': 'Production Kubernetes cluster administrator', 'source_snippet': 'Managed 50 Kubernetes clusters'},
+        ]
+        res = engine.verify_tailor_grounding(self.sample_resume, fabricated_resume, raw_claims)
+        # Only verbatim source_snippet claims stay in claim_evidence_map
+        self.assertEqual(len(res['claim_evidence_map']), 1)
+        self.assertEqual(res['claim_evidence_map'][0]['source_snippet'], 'Built Python REST APIs and SQL ETL jobs')
+        # Unverified Kubernetes snippet, new skill tokens, and fabricated 95% metric must be flagged
+        unverified_joined = ' '.join(res['unverified_claims']).lower()
+        self.assertIn('95%', unverified_joined)
+        self.assertIn('kubernetes', unverified_joined)
+        self.assertGreaterEqual(len(res['questions_for_candidate']), 1)
+
+        # Marking Kubernetes & Terraform as verified gap artifacts clears grounded gap claims while still blocking fabricated numbers
+        verified_claims = [
+            {'claim': 'Built Python REST APIs at Northwind Systems', 'source_snippet': 'Built Python REST APIs and SQL ETL jobs'},
+            {'claim': 'Verified Proof-of-Skill Project: Kubernetes', 'source_snippet': 'Verified Gap Project: Kubernetes'},
+        ]
+        res_verified = engine.verify_tailor_grounding(
+            self.sample_resume,
+            fabricated_resume,
+            verified_claims,
+            verified_gap_skills=['Kubernetes', 'Terraform'],
+        )
+        self.assertEqual(len(res_verified['claim_evidence_map']), 2)
+        unverified_after = ' '.join(res_verified['unverified_claims']).lower()
+        self.assertNotIn('kubernetes', unverified_after)
+        self.assertIn('95%', unverified_after)
+
+    def test_build_minimal_docx_bytes_roundtrip_and_xml_escaping(self):
+        tricky_resume = (
+            'Jordan Taylor\n'
+            'Focus: AT&T billing <v2>, C# & Python APIs\n'
+            'Experience (2023-2026):\n'
+            '- Cut API errors by 20% using strict validation & schema checks across production endpoints.\n'
+            '- Built repeatable CI pipelines ensuring single-column ATS readability across Workday forms.\n'
+        )
+        docx_bytes = build_minimal_docx_bytes(tricky_resume)
+        self.assertTrue(zipfile.is_zipfile(io.BytesIO(docx_bytes)))
+        with zipfile.ZipFile(io.BytesIO(docx_bytes), 'r') as zf:
+            names = set(zf.namelist())
+            self.assertIn('[Content_Types].xml', names)
+            self.assertIn('_rels/.rels', names)
+            self.assertIn('word/document.xml', names)
+
+        preview = LocalResumeFileAdapter().extract_plain_preview(docx_bytes, 'tailored_resume.docx')
+        self.assertIn('AT&T billing <v2>, C# & Python APIs', preview)
+        diag = analyze_ats_preview(preview)
+        self.assertEqual(diag['warnings'], [])
+
+    def test_voice_preserving_tailor_adapter_mocked_llm_and_honest_fallbacks(self):
+        captured_prompts: list[dict] = []
+
+        def fake_gemini_transport(url, headers, payload, timeout):
+            captured_prompts.append(payload)
+            return {
+                'steps': [{
+                    'type': 'model_output',
+                    'content': [{
+                        'type': 'text',
+                        'text': json.dumps({
+                            'tailored_text': (
+                                'Jordan Taylor\n'
+                                'Seattle, WA | jordan.taylor@example.org\n'
+                                'Skills: Python, SQL, Docker, REST APIs, Automated Testing\n'
+                                'Experience:\n'
+                                '- Software Engineer, Northwind Systems (2023-2026): Built Python REST APIs and '
+                                'SQL ETL jobs, reducing nightly query runtime by 20% across 12 production tables.\n'
+                            ),
+                            'changes': [{
+                                'original': 'Skills: Python, SQL, REST APIs, Docker, Automated Testing',
+                                'edited': 'Skills: Python, SQL, Docker, REST APIs, Automated Testing',
+                                'reason': 'Moved Docker forward to mirror role priorities using verified resume skills.',
+                            }],
+                            'claim_evidence_map': [{
+                                'claim': 'Built Python REST APIs and SQL ETL jobs reducing runtime by 20%',
+                                'source_snippet': 'Built Python REST APIs and SQL ETL jobs, reducing nightly query runtime by 20%',
+                            }],
+                            'unverified_claims': [],
+                            'questions_for_candidate': ['Do you have verified Kubernetes coursework or homelab notes?'],
+                            'why_this_role': 'Built Python REST APIs and Docker CI workflows aligned with Contoso Cloud.',
+                        }),
+                    }],
+                }],
+            }
+
+        model_adapter = UnifiedModelAdapter(
+            provider='gemini',
+            api_key='TEST_GEMINI_KEY',
+            environ={},
+            env_path=None,
+            config={'llm_provider': 'gemini', 'llm_model': 'gemini-3.8-flash'},
+            transport=fake_gemini_transport,
+            sleep_fn=lambda _: None,
+        )
+        tailor_adapter = VoicePreservingTailorAdapter(model_adapter=model_adapter)
+        out = tailor_adapter.tailor(self.sample_resume, self.sample_job, mode='auto')
+
+        self.assertIsInstance(out['result'], TailoredResumeResult)
+        self.assertEqual(out['generation_mode'], 'llm')
+        self.assertEqual(out['provider'], 'gemini')
+        self.assertEqual(len(out['claim_evidence_map']), 1)
+        self.assertEqual(out['slop_warnings'], [])
+        self.assertIn('Jordan Taylor', out['ats_preview_text'])
+        self.assertEqual(len(captured_prompts), 1)
+        prompt_blob = json.dumps(captured_prompts[0])
+        self.assertIn('<UNTRUSTED_DATA', prompt_blob)
+
+        # Unconfigured key under mode='auto' falls back deterministically with honest label
+        offline_model = UnifiedModelAdapter(
+            environ={},
+            env_path=None,
+            config={'llm_provider': 'auto'},
+        )
+        offline_out = VoicePreservingTailorAdapter(model_adapter=offline_model).tailor(
+            self.sample_resume,
+            self.sample_job,
+            verified_gap_skills=['Kubernetes'],
+            mode='auto',
+        )
+        self.assertEqual(offline_out['generation_mode'], 'deterministic_no_llm')
+        self.assertIn('Kubernetes', offline_out['tailored_text'])
+
+        # Configured LLM that errors upstream MUST fail honestly rather than masking failure as LLM success
+        def failing_transport(url, headers, payload, timeout):
+            raise urllib.error.URLError('network down')
+
+        failing_model = UnifiedModelAdapter(
+            provider='gemini',
+            api_key='TEST_GEMINI_KEY',
+            environ={},
+            env_path=None,
+            config={'llm_provider': 'gemini', 'llm_model': 'gemini-3.8-flash'},
+            max_retries=0,
+            transport=failing_transport,
+            sleep_fn=lambda _: None,
+        )
+        with self.assertRaises(ModelRequestError):
+            VoicePreservingTailorAdapter(model_adapter=failing_model).tailor(
+                self.sample_resume,
+                self.sample_job,
+                mode='auto',
+            )
+
+    def test_prepare_ai_lint_export_docx_routes_and_confirmed_immutability(self):
+        schema_path = Path(__file__).resolve().parent.parent / 'schemas' / 'application.schema.json'
+        app_schema = json.loads(schema_path.read_text(encoding='utf-8'))
+        allowed_claim_keys = set(app_schema['properties']['claim_evidence_map']['items']['properties'].keys())
+
+        with db.connection() as con:
+            con.execute('UPDATE profile SET resume=? WHERE id=1', (self.sample_resume,))
+            job_id = con.execute(
+                'INSERT INTO jobs(title, company, location, description, url) VALUES(?,?,?,?,?)',
+                (
+                    self.sample_job['title'],
+                    self.sample_job['company'],
+                    self.sample_job['location'],
+                    self.sample_job['description'] + ' Requirements: ' + self.sample_job['requirements'],
+                    self.sample_job['url'],
+                ),
+            ).lastrowid
+            con.execute(
+                'INSERT INTO gap_artifacts(job_id, skill_name, gap_type, micro_project_brief, proof_url, verified) '
+                'VALUES(?,?,?,?,?,?)',
+                (job_id, 'Kubernetes', 'stack', 'Mini deployment manifest', 'https://github.com/example/k8s-lab', 1),
+            )
+
+        code_status, body_status = routes_pipeline.handle_get('/api/pipeline/status')
+        self.assertEqual(code_status, 200)
+        self.assertIn('A-04', body_status['tasks_completed'])
+        self.assertTrue(body_status['tailor_adapter']['implemented'])
+
+        # Run /api/pipeline/prepare-ai deterministically
+        code_prep, body_prep = routes_pipeline.handle_post(
+            '/api/pipeline/prepare-ai',
+            {'job_id': job_id, 'mode': 'heuristic'},
+        )
+        self.assertEqual(code_prep, 200)
+        app_id = body_prep['application']['id']
+        self.assertEqual(body_prep['generation_mode'], 'deterministic_heuristic')
+        self.assertEqual(body_prep['verified_gap_skills'], ['Kubernetes'])
+        self.assertIn('Kubernetes', body_prep['tailored_text'])
+        self.assertTrue(len(body_prep['claim_evidence_map']) >= 1)
+        for item in body_prep['claim_evidence_map']:
+            self.assertEqual(set(item.keys()), allowed_claim_keys)
+
+        # Verify persistence + sanitized audit_events
+        stored = db.row('SELECT * FROM applications WHERE id=?', (app_id,))
+        self.assertIsNotNone(stored['claim_map_json'])
+        self.assertIsNotNone(stored['slop_warnings_json'])
+        self.assertIn('Jordan Taylor', stored['ats_preview_text'])
+        self.assertEqual(stored['resume_sha256'], body_prep['resume_sha256'])
+        audits = db.rows("SELECT details_json FROM audit_events WHERE action='resume_tailored'")
+        self.assertEqual(len(audits), 1)
+        self.assertNotIn('Northwind Systems', audits[0]['details_json'])
+
+        # Re-lint sloppy manual edit and save back to draft application
+        sloppy_draft = body_prep['tailored_text'] + '\n- Spearheaded cutting-edge synergy seamlessly!'
+        code_lint, body_lint = routes_pipeline.handle_post(
+            '/api/pipeline/tailor/lint',
+            {
+                'text': sloppy_draft,
+                'job_id': job_id,
+                'application_id': app_id,
+                'save': True,
+                'claim_evidence_map': body_prep['claim_evidence_map'],
+            },
+        )
+        self.assertEqual(code_lint, 200)
+        self.assertFalse(body_lint['clean'])
+        lint_terms = {item['term'] for item in body_lint['flagged_terms']}
+        self.assertIn('spearheaded', lint_terms)
+        self.assertEqual(body_lint['application']['id'], app_id)
+
+        # Export DOCX
+        code_exp, body_exp = routes_pipeline.handle_post(f'/api/pipeline/applications/{app_id}/export-docx', {})
+        self.assertEqual(code_exp, 200)
+        raw_docx = base64.b64decode(body_exp['content_base64'])
+        self.assertTrue(zipfile.is_zipfile(io.BytesIO(raw_docx)))
+        self.assertIn('Jordan Taylor', body_exp['ats_preview_text'])
+
+        # Lock application as 'confirmed' and ensure prepare-ai / lint-save / altered export reject with 409
+        with db.connection() as con:
+            con.execute("UPDATE applications SET status='confirmed' WHERE id=?", (app_id,))
+
+        code_409_prep, _ = routes_pipeline.handle_post(
+            '/api/pipeline/prepare-ai',
+            {'job_id': job_id, 'mode': 'heuristic'},
+        )
+        self.assertEqual(code_409_prep, 409)
+
+        code_409_lint, _ = routes_pipeline.handle_post(
+            '/api/pipeline/tailor/lint',
+            {'text': 'Modified text', 'application_id': app_id, 'save': True},
+        )
+        self.assertEqual(code_409_lint, 409)
+
+        code_409_exp, _ = routes_pipeline.handle_post(
+            f'/api/pipeline/applications/{app_id}/export-docx',
+            {'text': 'Altered unconfirmed text'},
+        )
+        self.assertEqual(code_409_exp, 409)
+
+        # Unimplemented A-05 route still returns 501
+        code_501, _ = routes_pipeline.handle_post('/api/pipeline/gaps', {})
+        self.assertEqual(code_501, 501)
+
+
+from app.adapters import GapAnalysisResult
+from app.adapters_pipeline import CallbackCheatSheetBuilder, GapBridgeAdapter, GapBridgeError, build_callback_packet
+
+
+def _fake_public_getaddrinfo(host, *args, **kwargs):
+    clean = str(host or '').strip().lower()
+    if clean in ('127.0.0.1', 'localhost', '::1'):
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, '', ('127.0.0.1', 0))]
+    if clean in ('169.254.169.254', '10.0.0.1'):
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, '', (clean, 0))]
+    return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, '', ('140.82.121.4', 0))]
+
+
+class GapBridgeAndCallbackTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._db_path = Path(self._tmp.name) / 'test_gaps_callback.sqlite3'
+        self._patch = mock.patch.object(db, 'DB_PATH', self._db_path)
+        self._dns_patch = mock.patch('socket.getaddrinfo', side_effect=_fake_public_getaddrinfo)
+        self._patch.start()
+        self._dns_patch.start()
+        db.init_db()
+        self.sample_resume = (
+            'Jordan Taylor\n'
+            'Seattle, WA | jordan.taylor@example.org\n'
+            'Skills: Python, SQL, RESTful Services, Automated Testing, CI/CD\n'
+            'Experience:\n'
+            '- Software Engineer, Northwind Systems (2023-2026): Built Python web services and SQL ETL pipelines, '
+            'cut latency by 20% across 12 production tables, and automated regression test suites.\n'
+        )
+        self.sample_job = {
+            'id': 1,
+            'title': 'Platform Backend Engineer',
+            'company': 'Contoso Cloud',
+            'location': 'Seattle, WA',
+            'description': 'Design Python APIs, REST APIs, pytest test harnesses, Kubernetes deployments, and Terraform modules.',
+            'requirements': 'Python, REST APIs, pytest, Kubernetes, Terraform',
+            'url': 'https://boards.greenhouse.io/contoso/jobs/9550',
+            'ats_family': 'greenhouse',
+        }
+
+    def tearDown(self):
+        self._dns_patch.stop()
+        self._patch.stop()
+        self._tmp.cleanup()
+
+    def test_classify_skill_gaps_wording_vs_true_skill_gaps(self):
+        gaps = engine.classify_skill_gaps(self.sample_resume, self.sample_job)
+        wording_terms = {w['job_term'].lower(): w['candidate_evidence'] for w in gaps['wording_gaps']}
+        true_skills = {s['skill_name'].lower(): s['micro_project_brief'] for s in gaps['skill_gaps']}
+
+        self.assertIn('pytest', wording_terms)
+        self.assertIn('rest', wording_terms)
+        self.assertTrue(wording_terms['pytest'])
+        self.assertIn('kubernetes', true_skills)
+        self.assertIn('terraform', true_skills)
+        self.assertIn('48', true_skills['kubernetes'])
+
+        unlocked = engine.classify_skill_gaps(
+            self.sample_resume,
+            self.sample_job,
+            verified_gap_skills=['Kubernetes'],
+        )
+        unlocked_map = {s['skill_name'].lower(): s['verified'] for s in unlocked['skill_gaps']}
+        self.assertTrue(unlocked_map['kubernetes'])
+        self.assertFalse(unlocked_map['terraform'])
+
+    def test_gap_bridge_adapter_offline_mocked_llm_untrusted_demotion_and_ssrf_guard(self):
+        offline_model = UnifiedModelAdapter(environ={}, env_path=None, config={'llm_provider': 'auto'})
+        offline = GapBridgeAdapter(model_adapter=offline_model).analyze(self.sample_resume, self.sample_job, mode='auto')
+        self.assertIsInstance(offline['result'], GapAnalysisResult)
+        self.assertEqual(offline['generation_mode'], 'deterministic_no_llm')
+        schema_art = offline['schema_artifact']
+        self.assertEqual(set(schema_art.keys()), {'job_id', 'wording_gaps', 'skill_gaps'})
+        self.assertIsInstance(schema_art['job_id'], str)
+        for item in schema_art['skill_gaps']:
+            self.assertEqual(set(item.keys()), {'skill_name', 'micro_project_brief', 'proof_url', 'verified'})
+            self.assertIsNone(item['proof_url'])
+            self.assertFalse(item['verified'])
+
+        captured_payloads: list[dict] = []
+
+        def fake_gemini_transport(url, headers, payload, timeout):
+            captured_payloads.append(payload)
+            return {
+                'steps': [{
+                    'type': 'model_output',
+                    'content': [{
+                        'type': 'text',
+                        'text': json.dumps({
+                            'wording_gaps': [
+                                {
+                                    'job_term': 'Unit Testing',
+                                    'candidate_evidence': 'automated regression test suites',
+                                },
+                                {
+                                    'job_term': 'GraphQL',
+                                    'candidate_evidence': 'Led global GraphQL federation for 50 services',
+                                },
+                            ],
+                            'skill_gaps': [
+                                {
+                                    'skill_name': 'Kubernetes',
+                                    'micro_project_brief': 'Ship a 2-pod k8s Deployment + readiness probe repo in 48h.',
+                                },
+                            ],
+                        }),
+                    }],
+                }],
+            }
+
+        llm_model = UnifiedModelAdapter(
+            provider='gemini',
+            api_key='TEST_GEMINI_KEY',
+            environ={},
+            env_path=None,
+            config={'llm_provider': 'gemini', 'llm_model': 'gemini-3.8-flash'},
+            transport=fake_gemini_transport,
+            sleep_fn=lambda _: None,
+        )
+        llm_out = GapBridgeAdapter(model_adapter=llm_model).analyze(self.sample_resume, self.sample_job, mode='auto')
+        self.assertEqual(llm_out['generation_mode'], 'llm')
+        self.assertIn('<UNTRUSTED_DATA', json.dumps(captured_payloads[0]))
+        wording_terms = {w['job_term'].lower() for w in llm_out['wording_gaps']}
+        skill_names = {s['skill_name'].lower() for s in llm_out['skill_gaps']}
+        # Grounded LLM wording gap stays in wording_gaps; ungrounded GraphQL evidence gets demoted into skill_gaps
+        self.assertIn('unit testing', wording_terms)
+        self.assertNotIn('graphql', wording_terms)
+        self.assertIn('graphql', skill_names)
+        self.assertIn('kubernetes', skill_names)
+
+        # SSRF proof URL checks
+        for bad_url in (
+            'javascript:alert(1)',
+            'http://127.0.0.1:8080/proof',
+            'http://169.254.169.254/latest/meta-data',
+            'http://10.0.0.1/internal',
+            'ftp://example.com/repo',
+        ):
+            with self.assertRaises(GapBridgeError):
+                GapBridgeAdapter.validate_proof_url(bad_url)
+        self.assertEqual(
+            GapBridgeAdapter.validate_proof_url(' https://github.com/jordan/k8s-proof '),
+            'https://github.com/jordan/k8s-proof',
+        )
+
+    def test_gap_routes_schema_validation_proof_verify_and_tailor_unlock(self):
+        code_status, body_status = routes_pipeline.handle_get('/api/pipeline/status')
+        self.assertEqual(code_status, 200)
+        self.assertIn('A-05', body_status['tasks_completed'])
+        self.assertTrue(body_status['gap_bridge_adapter']['implemented'])
+
+        gap_schema = json.loads(
+            (Path(__file__).resolve().parent.parent / 'schemas' / 'gap_artifact.schema.json').read_text(encoding='utf-8')
+        )
+        allowed_wg_keys = set(gap_schema['properties']['wording_gaps']['items']['properties'].keys())
+        allowed_sg_keys = set(gap_schema['properties']['skill_gaps']['items']['properties'].keys())
+
+        with db.connection() as con:
+            con.execute('UPDATE profile SET resume=? WHERE id=1', (self.sample_resume,))
+            job_id = con.execute(
+                'INSERT INTO jobs(title, company, location, description, url, ats_family) VALUES(?,?,?,?,?,?)',
+                (
+                    self.sample_job['title'],
+                    self.sample_job['company'],
+                    self.sample_job['location'],
+                    self.sample_job['description'] + ' Requirements: ' + self.sample_job['requirements'],
+                    self.sample_job['url'],
+                    'greenhouse',
+                ),
+            ).lastrowid
+
+        code_an, body_an = routes_pipeline.handle_post(
+            '/api/pipeline/gaps/analyze',
+            {'job_id': job_id, 'mode': 'heuristic'},
+        )
+        self.assertEqual(code_an, 200)
+        schema_art = body_an['schema_artifact']
+        self.assertEqual(schema_art['job_id'], str(job_id))
+        self.assertEqual(set(schema_art.keys()), set(gap_schema['required']))
+        for item in schema_art['wording_gaps']:
+            self.assertEqual(set(item.keys()), allowed_wg_keys)
+        for item in schema_art['skill_gaps']:
+            self.assertEqual(set(item.keys()), allowed_sg_keys)
+            self.assertIsNone(item['proof_url'])
+            self.assertFalse(item['verified'])
+
+        # GET routes read back persisted gap artifacts
+        code_all, body_all = routes_pipeline.handle_get('/api/pipeline/gaps')
+        self.assertEqual(code_all, 200)
+        self.assertGreaterEqual(body_all['count'], 1)
+        code_job_g, body_job_g = routes_pipeline.handle_get(f'/api/pipeline/jobs/{job_id}/gaps')
+        self.assertEqual(code_job_g, 200)
+        self.assertEqual(len(body_job_g['skill_gaps']), len(body_an['skill_gaps']))
+
+        # Before verifying proof, Kubernetes stays excluded from verified_gap_skills during tailor
+        code_p1, body_p1 = routes_pipeline.handle_post(
+            '/api/pipeline/prepare-ai',
+            {'job_id': job_id, 'mode': 'heuristic'},
+        )
+        self.assertEqual(code_p1, 200)
+        self.assertEqual(body_p1['verified_gap_skills'], [])
+        app_id = body_p1['application']['id']
+
+        k8s_gap = next(s for s in body_an['skill_gaps'] if s['skill_name'].lower() == 'kubernetes')
+        wg_item = body_an['wording_gaps'][0]
+
+        # Reject wording_gap verification and unsafe SSRF URL
+        code_wg_bad, _ = routes_pipeline.handle_post(
+            f"/api/pipeline/gaps/{wg_item['id']}/verify",
+            {'proof_url': 'https://github.com/jordan/test'},
+        )
+        self.assertEqual(code_wg_bad, 400)
+        code_ssrf, _ = routes_pipeline.handle_post(
+            f"/api/pipeline/gaps/{k8s_gap['id']}/verify",
+            {'proof_url': 'http://127.0.0.1:9000/bad'},
+        )
+        self.assertEqual(code_ssrf, 400)
+
+        # Verify Kubernetes proof URL
+        proof_url = 'https://github.com/jordan/k8s-deployment-proof'
+        code_ver, body_ver = routes_pipeline.handle_post(
+            f"/api/pipeline/gaps/{k8s_gap['id']}/verify",
+            {'proof_url': proof_url},
+        )
+        self.assertEqual(code_ver, 200)
+        self.assertEqual(body_ver['unlocked_skill'].lower(), 'kubernetes')
+        self.assertTrue(body_ver['artifact']['verified'])
+        self.assertIn(body_ver['unlocked_skill'], body_ver['verified_gap_skills'])
+
+        # Re-running analyze must preserve existing verified proof!
+        code_rean, body_rean = routes_pipeline.handle_post(
+            '/api/pipeline/gaps/analyze',
+            {'job_id': job_id, 'mode': 'heuristic'},
+        )
+        self.assertEqual(code_rean, 200)
+        re_k8s = next(s for s in body_rean['skill_gaps'] if s['skill_name'].lower() == 'kubernetes')
+        self.assertTrue(re_k8s['verified'])
+        self.assertEqual(re_k8s['proof_url'], proof_url)
+
+        # Re-running prepare-ai unlocks Kubernetes and updates callback_packet_json
+        code_p2, body_p2 = routes_pipeline.handle_post(
+            '/api/pipeline/prepare-ai',
+            {'job_id': job_id, 'application_id': app_id, 'mode': 'heuristic'},
+        )
+        self.assertEqual(code_p2, 200)
+        self.assertIn('Kubernetes', body_p2['verified_gap_skills'])
+        cb = body_p2['application']['callback_packet']
+        self.assertTrue(any(p['proof_url'] == proof_url for p in cb['verified_gap_proofs']))
+        self.assertEqual(len(cb['probe_questions']), 3)
+
+        # Contract compatibility: POST /api/pipeline/gaps still returns 501
+        code_501, _ = routes_pipeline.handle_post('/api/pipeline/gaps', {})
+        self.assertEqual(code_501, 501)
+
+    def test_callback_packet_auto_population_across_prepare_copilot_confirm_and_immutability(self):
+        # Test CallbackCheatSheetBuilder LLM wrapping with mock transport
+        captured: list[dict] = []
+
+        def fake_gemini_cb(url, headers, payload, timeout):
+            captured.append(payload)
+            return {
+                'steps': [{
+                    'type': 'model_output',
+                    'content': [{
+                        'type': 'text',
+                        'text': json.dumps({
+                            'why_this_role': 'Built Python services and Kubernetes proof directly aligned with Contoso Cloud.',
+                            'probe_questions': [
+                                'Walk through your Kubernetes readiness probe setup in the GitHub proof repo.',
+                                'How did you validate your 20% SQL ETL latency reduction across 12 tables?',
+                                'How do you design idempotent REST APIs for platform consumers?',
+                            ],
+                        }),
+                    }],
+                }],
+            }
+
+        cb_llm = CallbackCheatSheetBuilder(
+            model_adapter=UnifiedModelAdapter(
+                provider='gemini',
+                api_key='TEST_GEMINI_KEY',
+                environ={},
+                env_path=None,
+                config={'llm_provider': 'gemini', 'llm_model': 'gemini-3.8-flash'},
+                transport=fake_gemini_cb,
+                sleep_fn=lambda _: None,
+            )
+        ).build(
+            self.sample_job,
+            self.sample_resume,
+            self.sample_resume + '\nVerified Proof-of-Skill Project: Kubernetes',
+            verified_gap_proofs=[{'skill_name': 'Kubernetes', 'proof_url': 'https://github.com/jordan/k8s'}],
+            mode='llm',
+        )
+        self.assertEqual(cb_llm['callback_generation_mode'], 'llm')
+        self.assertEqual(len(cb_llm['probe_questions']), 3)
+        self.assertIn('<UNTRUSTED_DATA', json.dumps(captured[0]))
+
+        # Seed profile, job, verified proof, and walk prepare-ai -> copilot -> confirm -> immutable checks
+        with db.connection() as con:
+            con.execute('UPDATE profile SET resume=? WHERE id=1', (self.sample_resume,))
+            job_id = con.execute(
+                'INSERT INTO jobs(title, company, location, description, url, origin, ats_family) VALUES(?,?,?,?,?,?,?)',
+                (
+                    self.sample_job['title'],
+                    self.sample_job['company'],
+                    self.sample_job['location'],
+                    self.sample_job['description'],
+                    self.sample_job['url'],
+                    'imported_url',
+                    'greenhouse',
+                ),
+            ).lastrowid
+            con.execute(
+                'INSERT INTO gap_artifacts(job_id, skill_name, gap_type, micro_project_brief, proof_url, verified) '
+                "VALUES(?, 'Kubernetes', 'true_skill_gap', '48h k8s deployment brief', 'https://github.com/jordan/k8s', 1)",
+                (job_id,),
+            )
+
+        code_prep, body_prep = routes_pipeline.handle_post(
+            '/api/pipeline/prepare-ai',
+            {'job_id': job_id, 'mode': 'heuristic'},
+        )
+        self.assertEqual(code_prep, 200)
+        app_id = body_prep['application']['id']
+        cb1 = body_prep['application']['callback_packet']
+        self.assertTrue(cb1['why_this_role'])
+        self.assertEqual(len(cb1['probe_questions']), 3)
+        self.assertIsInstance(cb1['diff_summary'], list)
+
+        # Co-Pilot merges non-sensitive answers and keeps sensitive fields out of callback_packet_json
+        code_cop, body_cop = routes_pipeline.handle_post(
+            f'/api/pipeline/applications/{app_id}/copilot',
+            {
+                'candidate_answers': {'why_company_and_role': 'Excited to scale Contoso Cloud APIs with tested Python services.'},
+                'sensitive_answers': {'work_authorization': 'US Citizen', 'salary_expectation': '$160k'},
+            },
+        )
+        self.assertEqual(code_cop, 200)
+        cb2 = body_cop['application']['callback_packet']
+        self.assertIn('why_company_and_role', cb2['submitted_answers'])
+        self.assertNotIn('salary_expectation', cb2['submitted_answers'])
+        self.assertNotIn('work_authorization', cb2['submitted_answers'])
+
+        # Confirm updates hashes + confirmation_reference in callback_packet_json
+        code_conf, body_conf = routes_pipeline.handle_post(
+            f'/api/pipeline/applications/{app_id}/confirm',
+            {
+                'explicit_user_approval': True,
+                'sensitive_fields_confirmed': True,
+                'sensitive_answers': {
+                    'work_authorization': 'Yes',
+                    'visa_sponsorship': 'No',
+                    'salary_expectation': '$160k',
+                    'veteran_status': 'Prefer not to say',
+                    'disability_status': 'Prefer not to say',
+                    'references': 'Available upon request',
+                },
+                'outcome': 'confirmed',
+                'confirmation_reference': 'GH-CONF-A05-777',
+            },
+        )
+        self.assertEqual(code_conf, 200)
+        cb3 = body_conf['application']['callback_packet']
+        self.assertEqual(cb3['confirmation_reference'], 'GH-CONF-A05-777')
+        self.assertTrue(cb3['submitted_answers']['sensitive_fields_confirmed'])
+        self.assertTrue(cb3['resume_sha256'])
+        self.assertTrue(cb3['answers_sha256'])
+        self.assertEqual(len(cb3['probe_questions']), 3)
+
+        # Confirmed application immutability on GET & POST /callback-packet
+        code_get_cb, body_get_cb = routes_pipeline.handle_get(f'/api/pipeline/applications/{app_id}/callback-packet')
+        self.assertEqual(code_get_cb, 200)
+        self.assertTrue(body_get_cb['immutable'])
+
+        code_post_idemp, body_post_idemp = routes_pipeline.handle_post(
+            f'/api/pipeline/applications/{app_id}/callback-packet',
+            {},
+        )
+        self.assertEqual(code_post_idemp, 200)
+        self.assertTrue(body_post_idemp['immutable'])
+
+        code_post_mut, _ = routes_pipeline.handle_post(
+            f'/api/pipeline/applications/{app_id}/callback-packet',
+            {'why_this_role': 'Attempted tamper override', 'force': True},
+        )
+        self.assertEqual(code_post_mut, 409)
+
+        # Demo test_submitted stays isolated from callback updates (uses distinct demo job_id due to UNIQUE job_id)
+        with db.connection() as con:
+            demo_job_id = con.execute(
+                'INSERT INTO jobs(title, company, location, description, url, origin, ats_family) VALUES(?,?,?,?,?,?,?)',
+                (
+                    'Demo Role',
+                    'Demo Corp',
+                    'Remote',
+                    'Python backend service role.',
+                    'https://example.com/jobs/demo-1',
+                    'fictional-sample',
+                    'unknown',
+                ),
+            ).lastrowid
+            demo_app_id = con.execute(
+                "INSERT INTO applications(job_id, tailored_resume, fit_score, status, confirmation) VALUES(?,?,?,'test_submitted',?)",
+                (demo_job_id, 'A' * 80, 75, 'DEMO ONLY - no job site contacted'),
+            ).lastrowid
+        code_demo_409, _ = routes_pipeline.handle_post(
+            f'/api/pipeline/applications/{demo_app_id}/callback-packet',
+            {'mode': 'heuristic'},
+        )
+        self.assertEqual(code_demo_409, 409)
+
+
+from app.adapters_pipeline import PlaywrightHITLHelper
+
+
+class PlaywrightHITLAndPipelineReadinessTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._db_path = Path(self._tmp.name) / 'test_hitl_readiness.sqlite3'
+        self._patch = mock.patch.object(db, 'DB_PATH', self._db_path)
+        self._dns_patch = mock.patch('socket.getaddrinfo', side_effect=_fake_public_getaddrinfo)
+        self._patch.start()
+        self._dns_patch.start()
+        db.init_db()
+        self.sample_resume = (
+            'Jordan Taylor\n'
+            'Seattle, WA | jordan.taylor@example.org | (512) 555-0199\n'
+            'https://linkedin.com/in/jordantaylor | https://github.com/jordantaylor\n'
+            'Skills: Python, SQL, REST APIs, Docker, Automated Testing\n'
+            'Experience:\n'
+            '- Software Engineer, Northwind Systems (2023-2026): Built Python web services and SQL ETL pipelines, '
+            'reducing nightly batch latency by 20% across 12 production tables.\n'
+        )
+        self.real_job = {
+            'id': 101,
+            'title': 'Platform Engineer',
+            'company': 'Acme Cloud',
+            'location': 'Remote',
+            'description': 'Build reliable Python APIs, SQL ETL pipelines, and Docker workflows.',
+            'url': 'https://boards.greenhouse.io/acmecloud/jobs/4411',
+            'origin': 'imported_url',
+            'ats_family': 'greenhouse',
+        }
+
+    def tearDown(self):
+        self._dns_patch.stop()
+        self._patch.stop()
+        self._tmp.cleanup()
+
+    def test_playwright_hitl_consent_fictional_guard_fallback_and_mocked_headed_run(self):
+        caps = CoPilotApplicationAdapter.inspect_capabilities(config={'enable_playwright_hitl': False}, environ={})
+        self.assertIn('greenhouse', caps['hitl_supported_portals'])
+        self.assertFalse(caps['playwright_hitl_enabled'])
+
+        adapter_off = CoPilotApplicationAdapter(config={'enable_playwright_hitl': False})
+        base_payload = {
+            'job': self.real_job,
+            'approved_resume': self.sample_resume,
+            'candidate_answers': {
+                'full_name': 'Jordan Taylor',
+                'why_company_and_role': 'Strong match on Python and SQL ETL pipelines.',
+                # Even if a caller slips a sensitive key into candidate_answers, it must NEVER enter HITL field_plan
+                'salary_expectation': '$999k',
+                'work_authorization': 'Secret',
+            },
+        }
+
+        with self.assertRaises(PermissionError):
+            adapter_off.launch_hitl_autofill(base_payload, explicit_user_approval=False, environ={})
+
+        with self.assertRaises(ApplicationError):
+            adapter_off.launch_hitl_autofill(
+                {**base_payload, 'job': {'origin': 'fictional-sample', 'url': 'https://example.com/jobs/1'}},
+                explicit_user_approval=True,
+                environ={},
+            )
+
+        # Config disabled -> graceful D3 Co-Pilot fallback
+        fb = adapter_off.launch_hitl_autofill(base_payload, explicit_user_approval=True, environ={})
+        self.assertEqual(fb['mode'], 'copilot_fallback')
+        self.assertFalse(fb['executed'])
+        self.assertFalse(fb['submitted'])
+        self.assertEqual(fb['locked_sensitive_fields'], list(SENSITIVE_FIELDS))
+        self.assertTrue(any(f['field_key'] == 'email' for f in fb['non_sensitive_field_plan']))
+        for item in fb['non_sensitive_field_plan']:
+            self.assertNotIn(item['field_key'], SENSITIVE_FIELDS)
+        self.assertIn('ordered_sections', fb['copilot_packet'])
+
+        # Enabled + mocked headed Playwright runner
+        adapter_on = CoPilotApplicationAdapter(config={'enable_playwright_hitl': True})
+        captured: dict = {}
+
+        def fake_runner(*, url, field_plan, locked_sensitive_fields, timeout_ms):
+            captured['url'] = url
+            captured['field_plan'] = field_plan
+            captured['locked'] = locked_sensitive_fields
+            return {
+                'page_title': 'Acme Cloud — Platform Engineer',
+                'filled_fields': [f['field_key'] for f in field_plan],
+                'skipped_fields': [],
+                'submitted': False,
+            }
+
+        res_ok = adapter_on.launch_hitl_autofill(base_payload, explicit_user_approval=True, runner=fake_runner, environ={})
+        self.assertEqual(res_ok['mode'], 'playwright_hitl')
+        self.assertTrue(res_ok['executed'])
+        self.assertFalse(res_ok['submitted'])
+        self.assertEqual(captured['locked'], list(SENSITIVE_FIELDS))
+        sent_keys = {f['field_key'] for f in captured['field_plan']}
+        self.assertTrue({'first_name', 'last_name', 'email', 'phone'}.issubset(sent_keys))
+        self.assertTrue(sent_keys.isdisjoint(set(SENSITIVE_FIELDS)))
+
+        # Browser launch failure degrades cleanly to D3 Co-Pilot fallback instead of crashing
+        def broken_runner(**_kwargs):
+            raise RuntimeError('Chromium executable missing on Computer B')
+
+        res_broken = adapter_on.launch_hitl_autofill(base_payload, explicit_user_approval=True, runner=broken_runner, environ={})
+        self.assertEqual(res_broken['mode'], 'copilot_fallback')
+        self.assertFalse(res_broken['executed'])
+        self.assertFalse(res_broken['submitted'])
+        self.assertIn('Headed browser launch unavailable', res_broken['fallback_reason'])
+
+    def test_hitl_autofill_route_consent_immutability_and_audit_log(self):
+        with db.connection() as con:
+            con.execute('UPDATE profile SET resume=? WHERE id=1', (self.sample_resume,))
+            job_id = con.execute(
+                'INSERT INTO jobs(title, company, location, description, url, origin, ats_family) VALUES(?,?,?,?,?,?,?)',
+                (
+                    self.real_job['title'],
+                    self.real_job['company'],
+                    self.real_job['location'],
+                    self.real_job['description'],
+                    self.real_job['url'],
+                    'imported_url',
+                    'greenhouse',
+                ),
+            ).lastrowid
+
+        code_prep, body_prep = routes_pipeline.handle_post(
+            '/api/pipeline/prepare-ai',
+            {'job_id': job_id, 'mode': 'heuristic'},
+        )
+        self.assertEqual(code_prep, 200)
+        app_id = body_prep['application']['id']
+
+        code_403, _ = routes_pipeline.handle_post(
+            f'/api/pipeline/applications/{app_id}/hitl-autofill',
+            {'explicit_user_approval': False},
+        )
+        self.assertEqual(code_403, 403)
+
+        with mock.patch.object(PlaywrightHITLHelper, 'is_enabled', return_value=False):
+            code_ok, body_ok = routes_pipeline.handle_post(
+                f'/api/pipeline/applications/{app_id}/hitl-autofill',
+                {'explicit_user_approval': True, 'candidate_answers': {'location': 'Seattle, WA'}},
+            )
+        self.assertEqual(code_ok, 200)
+        self.assertEqual(body_ok['hitl_session']['mode'], 'copilot_fallback')
+        self.assertFalse(body_ok['hitl_session']['submitted'])
+        self.assertEqual(body_ok['application']['answers_data']['last_hitl_session']['mode'], 'copilot_fallback')
+
+        audits = db.rows("SELECT details_json FROM audit_events WHERE action='hitl_autofill_staged'")
+        self.assertEqual(len(audits), 1)
+        self.assertIn('"submitted": false', audits[0]['details_json'].lower())
+
+        # Confirm immutability & test_submitted isolation
+        with db.connection() as con:
+            con.execute("UPDATE applications SET status='confirmed' WHERE id=?", (app_id,))
+            demo_job_id = con.execute(
+                'INSERT INTO jobs(title, company, location, description, url, origin, ats_family) VALUES(?,?,?,?,?,?,?)',
+                ('Demo Job', 'Example Co', 'Remote', 'Python SQL', 'https://example.com/j/9', 'fictional-sample', 'unknown'),
+            ).lastrowid
+            demo_app_id = con.execute(
+                "INSERT INTO applications(job_id, tailored_resume, fit_score, status, confirmation) VALUES(?,?,?,'test_submitted',?)",
+                (demo_job_id, self.sample_resume, 70, 'DEMO ONLY'),
+            ).lastrowid
+
+        self.assertEqual(
+            routes_pipeline.handle_post(f'/api/pipeline/applications/{app_id}/hitl-autofill', {'explicit_user_approval': True})[0],
+            409,
+        )
+        self.assertEqual(
+            routes_pipeline.handle_post(f'/api/pipeline/applications/{demo_app_id}/hitl-autofill', {'explicit_user_approval': True})[0],
+            409,
+        )
+
+    def test_queue_batch_10_jobs_and_readiness_scorecard_acceptance_test_7(self):
+        code_st, body_st = routes_pipeline.handle_get('/api/pipeline/status')
+        self.assertEqual(code_st, 200)
+        self.assertIn('A-06', body_st['tasks_completed'])
+        self.assertIn('A-07', body_st['tasks_completed'])
+
+        # Clear default seeded jobs so we test clean 10-job pipeline from exact known count
+        with db.connection() as con:
+            con.execute('DELETE FROM applications')
+            con.execute('DELETE FROM gap_artifacts')
+            con.execute('DELETE FROM jobs')
+            con.execute('UPDATE profile SET resume=? WHERE id=1', (self.sample_resume,))
+            real_job_ids: list[int] = []
+            for idx in range(1, 11):
+                jid = con.execute(
+                    'INSERT INTO jobs(title, company, location, description, url, origin, ats_family) VALUES(?,?,?,?,?,?,?)',
+                    (
+                        f'Backend Engineer #{idx}',
+                        f'CloudCorp{idx}',
+                        'Remote',
+                        f'Build Python APIs, SQL ETL jobs, Docker harnesses, and Kubernetes role {idx}.',
+                        f'https://boards.greenhouse.io/cloudcorp{idx}/jobs/{1000 + idx}',
+                        'imported_url',
+                        'greenhouse',
+                    ),
+                ).lastrowid
+                real_job_ids.append(int(jid))
+
+        code_batch, body_batch = routes_pipeline.handle_post(
+            '/api/pipeline/queue-batch',
+            {'limit': 10, 'mode': 'heuristic'},
+        )
+        self.assertEqual(code_batch, 200)
+        self.assertEqual(body_batch['processed_count'], 10)
+        self.assertEqual(body_batch['prepared_count'], 10)
+        self.assertEqual(body_batch['error_count'], 0)
+
+        readiness = body_batch['readiness']
+        self.assertEqual(readiness['target_real_applications'], 10)
+        self.assertEqual(readiness['prepared_applications_count'], 10)
+        self.assertEqual(readiness['tailored_with_claim_map_count'], 10)
+        self.assertEqual(readiness['copilot_staged_count'], 10)
+        self.assertEqual(readiness['callback_ready_count'], 10)
+        self.assertTrue(readiness['ten_job_pipeline_ready'])
+        self.assertEqual(readiness['confirmed_real_submissions_count'], 0)
+        self.assertFalse(readiness['ten_real_submissions_reached'])
+
+        # Confirm 1 real submission with external receipt ID & check readiness increments honestly
+        first_app_id = body_batch['results'][0]['application_id']
+        code_conf, _ = routes_pipeline.handle_post(
+            f'/api/pipeline/applications/{first_app_id}/confirm',
+            {
+                'explicit_user_approval': True,
+                'sensitive_fields_confirmed': True,
+                'sensitive_answers': {
+                    'work_authorization': 'Authorized to work in the US without sponsorship',
+                    'visa_sponsorship': 'No',
+                    'salary_expectation': 'Negotiable ($140k-$165k)',
+                    'veteran_status': 'Decline to self-identify',
+                    'disability_status': 'Decline to self-identify',
+                    'references': 'Available upon request',
+                },
+                'outcome': 'confirmed',
+                'confirmation_reference': 'GH-BATCH-1001',
+            },
+        )
+        self.assertEqual(code_conf, 200)
+
+        code_r, body_r = routes_pipeline.handle_get('/api/pipeline/readiness')
+        self.assertEqual(code_r, 200)
+        self.assertEqual(body_r['confirmed_real_submissions_count'], 1)
+        self.assertEqual(body_r['demo_test_submissions_count'], 0)
+        self.assertEqual(body_r['prepared_applications_count'], 10)
 
 
 if __name__ == '__main__':
