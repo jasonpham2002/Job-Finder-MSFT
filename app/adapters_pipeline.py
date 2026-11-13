@@ -18,7 +18,11 @@ import zlib
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional
 
-from .adapters import ModelAdapter, ResumeFileAdapter
+from datetime import datetime
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+
+from . import engine
+from .adapters import JobDiscoveryAdapter, JobPreflight, ModelAdapter, ResumeFileAdapter
 
 ROOT = Path(__file__).resolve().parents[1]
 PROMPTS_DIR = ROOT / 'prompts'
@@ -928,3 +932,448 @@ def analyze_ats_preview(preview_text: str) -> dict[str, Any]:
         'char_count': len(preview_text),
         'warnings': warnings,
     }
+
+
+# ---------------------------------------------------------------------------
+# Task A-02: Live JobDiscoveryAdapter (Greenhouse / Lever / Ashby / Serper) + D1 Pre-Flight
+# ---------------------------------------------------------------------------
+
+_SERPER_SEARCH_URL = 'https://google.serper.dev/search'
+_SUPPORTED_BOARD_ATS = ('greenhouse', 'lever', 'ashby')
+_BOARD_SLUG_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$')
+_TRACKING_QUERY_PARAMS = {
+    'utm_source',
+    'utm_medium',
+    'utm_campaign',
+    'utm_term',
+    'utm_content',
+    'utm_id',
+    'gh_src',
+    'lever-source',
+    'ref',
+    'trk',
+    'fbclid',
+    'gclid',
+    'mc_cid',
+    'mc_eid',
+}
+
+
+class JobDiscoveryError(RuntimeError):
+    """Raised when job discovery encounters an unrecoverable request or input error."""
+
+
+def normalize_job_url(url: str) -> str:
+    """Canonicalize a job URL by stripping tracking query params and fragments."""
+    raw = str(url or '').strip()
+    if not raw:
+        return ''
+    parsed = urlparse(raw)
+    scheme = (parsed.scheme or 'https').lower()
+    netloc = parsed.netloc.lower()
+    path = parsed.path or '/'
+    if len(path) > 1:
+        path = path.rstrip('/')
+    kept_params = [
+        (k, v)
+        for k, v in parse_qsl(parsed.query, keep_blank_values=False)
+        if k.lower() not in _TRACKING_QUERY_PARAMS
+    ]
+    kept_params.sort(key=lambda pair: (pair[0].lower(), pair[1]))
+    query = urlencode(kept_params)
+    return urlunparse((scheme, netloc, path, '', query, ''))
+
+
+def parse_board_spec(spec: Any) -> tuple[str, str]:
+    """Parse a public ATS board descriptor like 'greenhouse:stripe' or {'ats': 'lever', 'board': 'figma'}."""
+    if isinstance(spec, Mapping):
+        ats = str(spec.get('ats') or spec.get('ats_family') or 'greenhouse').strip().lower()
+        board = str(spec.get('board') or spec.get('slug') or '').strip()
+    else:
+        text = str(spec or '').strip()
+        if ':' in text:
+            ats, board = text.split(':', 1)
+            ats = ats.strip().lower()
+            board = board.strip()
+        else:
+            ats = 'greenhouse'
+            board = text
+    if ats not in _SUPPORTED_BOARD_ATS:
+        raise JobDiscoveryError(f'Unsupported ATS board type: {ats!r}. Supported: {_SUPPORTED_BOARD_ATS}.')
+    if not _BOARD_SLUG_RE.fullmatch(board):
+        raise JobDiscoveryError(f'Invalid ATS board slug: {board!r}.')
+    return ats, board
+
+
+def _tokenize_search_terms(text: str) -> list[str]:
+    tokens = [tok for tok in re.findall(r'[A-Za-z0-9+#.]{2,}', str(text or '').lower()) if tok]
+    # Preserve order while deduplicating.
+    return list(dict.fromkeys(tokens))
+
+
+def _matches_search_filters(
+    posting: Mapping[str, Any],
+    query_tokens: list[str],
+    location_tokens: list[str],
+) -> tuple[bool, int]:
+    """Return (matches, score) for a posting against optional query and location tokens."""
+    title_text = str(posting.get('title') or '').lower()
+    company_text = str(posting.get('company') or '').lower()
+    desc_text = str(posting.get('description') or '').lower()
+    loc_text = str(posting.get('location') or '').lower()
+
+    if location_tokens:
+        loc_haystack = f'{loc_text} {desc_text[:600]}'
+        if not all(tok in loc_haystack for tok in location_tokens):
+            return False, 0
+
+    if not query_tokens:
+        return True, 1
+
+    title_hits = sum(1 for tok in query_tokens if tok in title_text)
+    full_haystack = f'{title_text} {company_text} {desc_text}'
+    total_hits = sum(1 for tok in query_tokens if tok in full_haystack)
+    if total_hits == 0:
+        return False, 0
+    return True, (title_hits * 3 + total_hits)
+
+
+def _infer_company_from_serper_title(title: str) -> tuple[str, str]:
+    """Best-effort split of 'Role - Company' or 'Role at Company' search titles."""
+    clean = str(title or '').strip()
+    for sep in (' - ', ' | ', ' at '):
+        if sep in clean:
+            parts = clean.split(sep)
+            left = parts[0].strip()
+            right = parts[1].strip() if len(parts) > 1 else ''
+            # Ignore generic board suffixes when inferring company.
+            if right and right.lower() not in {'linkedin', 'indeed', 'lever', 'greenhouse', 'ashby', 'workday', 'jobs'}:
+                return left[:200], right[:120]
+    return clean[:200], ''
+
+
+class LiveJobDiscoveryAdapter(JobDiscoveryAdapter):
+    """Public ATS board discovery (Greenhouse, Lever, Ashby), optional Serper web search, and D1 Pre-Flight."""
+
+    def __init__(
+        self,
+        environ: Optional[Mapping[str, str]] = None,
+        env_path: Any = _UNSET,
+        config: Optional[dict[str, Any]] = None,
+        http_get: Optional[Callable[[str, str, float], tuple[int, dict[str, str], bytes]]] = None,
+        serper_post: Optional[Callable[[str, dict[str, str], dict[str, Any], float], dict[str, Any]]] = None,
+        timeout_seconds: float = 8.0,
+    ):
+        resolved_env_path = None if (environ is not None and env_path is _UNSET) else (
+            ROOT / '.env' if env_path is _UNSET else env_path
+        )
+        self._env = load_local_env(env_path=resolved_env_path, base_environ=environ)
+        self._config = dict(config) if config is not None else load_pipeline_config()
+        self._http_get = http_get or engine._default_http_get
+        self._serper_post = serper_post or _default_transport
+        self.timeout_seconds = float(timeout_seconds)
+        self.last_metadata: dict[str, Any] = {}
+
+    @classmethod
+    def inspect_capabilities(
+        cls,
+        environ: Optional[Mapping[str, str]] = None,
+        env_path: Any = _UNSET,
+        config: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """Report discovery capabilities without exposing SEARCH_API_KEY."""
+        adapter = cls(environ=environ, env_path=env_path, config=config)
+        return {
+            'ats_feeds': list(_SUPPORTED_BOARD_ATS),
+            'serper_configured': bool(adapter._env.get('SEARCH_API_KEY', '').strip()),
+            'supports_url_import': True,
+            'preflight_dimensions': ['ats_family', 'liveness_status', 'scam_risk', 'friction_roi'],
+        }
+
+    def preflight_job(self, job: dict[str, Any], now: Optional[datetime] = None) -> JobPreflight:
+        """Evaluate D1 Pre-Flight Shield on any job dict."""
+        evaluated = engine.evaluate_preflight(job, now=now)
+        return JobPreflight(
+            ats_family=evaluated['ats_family'],
+            liveness_status=evaluated['liveness_status'],
+            scam_risk=evaluated['scam_risk'],
+            scam_flags=list(evaluated['scam_flags']),
+            friction_roi=evaluated['friction_roi'],
+            notes=evaluated['notes'],
+        )
+
+    def _fetch_board_json(self, api_url: str) -> Any:
+        status, _, raw = self._http_get(api_url, 'application/json', self.timeout_seconds)
+        if status != 200:
+            raise JobDiscoveryError(f'Public ATS board returned HTTP {status} for {api_url}')
+        try:
+            return json.loads(raw.decode('utf-8', errors='replace'))
+        except ValueError as exc:
+            raise JobDiscoveryError(f'Invalid JSON returned by ATS board {api_url}: {exc}') from exc
+
+    def _fetch_ats_board(self, ats: str, board: str) -> list[dict[str, Any]]:
+        if ats == 'greenhouse':
+            url = f'https://boards-api.greenhouse.io/v1/boards/{board}/jobs?content=true'
+            payload = self._fetch_board_json(url)
+            raw_jobs = payload.get('jobs') if isinstance(payload, dict) else []
+            out: list[dict[str, Any]] = []
+            for item in raw_jobs or []:
+                if not isinstance(item, Mapping):
+                    continue
+                loc = item.get('location')
+                loc_name = str(loc.get('name') or '').strip() if isinstance(loc, Mapping) else ''
+                out.append({
+                    'title': engine._text_from_html(item.get('title', ''))[:200],
+                    'company': str(item.get('company_name') or engine._format_board_name(board))[:120],
+                    'description': engine._text_from_html(item.get('content', ''))[:12000],
+                    'location': loc_name[:120],
+                    'salary_text': '',
+                    'posted_at': str(item.get('first_published') or item.get('updated_at') or '')[:40],
+                    'url': str(item.get('absolute_url') or '').strip(),
+                    'ats_family': 'greenhouse',
+                    'source_provider': f'greenhouse:{board}',
+                    'extraction_status': 'verified',
+                })
+            return out
+
+        if ats == 'lever':
+            url = f'https://api.lever.co/v0/postings/{board}?mode=json'
+            payload = self._fetch_board_json(url)
+            raw_jobs = payload if isinstance(payload, list) else []
+            out = []
+            for item in raw_jobs:
+                if not isinstance(item, Mapping):
+                    continue
+                cats = item.get('categories') or {}
+                loc_name = str(cats.get('location') or '').strip() if isinstance(cats, Mapping) else ''
+                sections = [str(item.get('descriptionPlain') or engine._text_from_html(item.get('description', ''))).strip()]
+                for lst in item.get('lists') or []:
+                    if isinstance(lst, Mapping):
+                        heading = str(lst.get('text') or '').strip()
+                        items_txt = engine._text_from_html(lst.get('content', ''))
+                        if heading or items_txt:
+                            sections.append(f'{heading}: {items_txt}'.strip(': '))
+                if item.get('additionalPlain'):
+                    sections.append(str(item['additionalPlain']).strip())
+                out.append({
+                    'title': str(item.get('text') or '').strip()[:200],
+                    'company': engine._format_board_name(board)[:120],
+                    'description': ' '.join(s for s in sections if s)[:12000],
+                    'location': loc_name[:120],
+                    'salary_text': engine._format_lever_salary(item),
+                    'posted_at': engine._epoch_ms_to_iso(item.get('createdAt')),
+                    'url': str(item.get('hostedUrl') or '').strip(),
+                    'ats_family': 'lever',
+                    'source_provider': f'lever:{board}',
+                    'extraction_status': 'verified',
+                })
+            return out
+
+        if ats == 'ashby':
+            url = f'https://api.ashbyhq.com/posting-api/job-board/{board}?includeCompensation=true'
+            payload = self._fetch_board_json(url)
+            raw_jobs = payload.get('jobs') if isinstance(payload, dict) else []
+            out = []
+            for item in raw_jobs or []:
+                if not isinstance(item, Mapping):
+                    continue
+                if item.get('isListed') is False:
+                    continue
+                comp = item.get('compensation')
+                comp_summary = str(comp.get('compensationTierSummary') or '').strip() if isinstance(comp, Mapping) else ''
+                desc = str(item.get('descriptionPlain') or engine._text_from_html(item.get('descriptionHtml', ''))).strip()
+                out.append({
+                    'title': str(item.get('title') or '').strip()[:200],
+                    'company': engine._format_board_name(board)[:120],
+                    'description': desc[:12000],
+                    'location': str(item.get('location') or '').strip()[:120],
+                    'salary_text': comp_summary[:80],
+                    'posted_at': str(item.get('publishedAt') or '')[:40],
+                    'url': str(item.get('jobUrl') or '').strip(),
+                    'ats_family': 'ashby',
+                    'source_provider': f'ashby:{board}',
+                    'extraction_status': 'verified',
+                })
+            return out
+
+        raise JobDiscoveryError(f'Unsupported ATS family: {ats}')
+
+    def _search_serper(
+        self,
+        query: str,
+        location: str,
+        limit: int,
+        hydrate_urls: bool,
+    ) -> list[dict[str, Any]]:
+        api_key = self._env.get('SEARCH_API_KEY', '').strip()
+        if not api_key or not query.strip():
+            return []
+
+        search_terms = [query.strip()]
+        if location.strip():
+            search_terms.append(location.strip())
+        q_lower = query.lower()
+        if 'site:' not in q_lower and 'job' not in q_lower and 'career' not in q_lower:
+            search_terms.append('jobs')
+        payload = {'q': ' '.join(search_terms), 'num': max(1, min(int(limit), 20))}
+        headers = {
+            'Content-Type': 'application/json',
+            'X-API-KEY': api_key,
+            'User-Agent': 'JobFinderMSFT/1.0 (+public-discovery)',
+        }
+        try:
+            response = self._serper_post(_SERPER_SEARCH_URL, headers, payload, self.timeout_seconds)
+        except Exception as exc:
+            safe_msg = _redact_secrets(str(exc), [api_key])
+            raise JobDiscoveryError(f'Serper search failed: {safe_msg}') from exc
+
+        organic = response.get('organic') if isinstance(response, Mapping) else []
+        results: list[dict[str, Any]] = []
+        for idx, item in enumerate(organic or []):
+            if not isinstance(item, Mapping):
+                continue
+            link = str(item.get('link') or '').strip()
+            if not link:
+                continue
+            try:
+                engine.valid_public_url(link)
+            except ValueError:
+                continue
+
+            raw_title = str(item.get('title') or '').strip()
+            inferred_title, inferred_company = _infer_company_from_serper_title(raw_title)
+            snippet = str(item.get('snippet') or '').strip()
+            posted_at = str(item.get('date') or '').strip()[:40]
+            ats_family = engine.detect_ats_family(link)
+
+            record: dict[str, Any] = {
+                'title': inferred_title,
+                'company': inferred_company,
+                'description': snippet,
+                'location': location.strip()[:120],
+                'salary_text': '',
+                'posted_at': posted_at,
+                'url': link,
+                'ats_family': ats_family,
+                'source_provider': 'serper',
+                'extraction_status': 'snippet_only',
+            }
+
+            if hydrate_urls and idx < limit:
+                try:
+                    inspected = engine.inspect_public_job_url(link, http_get=self._http_get)
+                except ValueError:
+                    inspected = {'extraction_status': 'manual_fallback'}
+                if inspected.get('extraction_status') in ('verified', 'needs_review'):
+                    record.update({
+                        'title': inspected.get('title') or record['title'],
+                        'company': inspected.get('company') or record['company'],
+                        'description': inspected.get('description') or record['description'],
+                        'location': inspected.get('location') or record['location'],
+                        'salary_text': inspected.get('salary_text') or record['salary_text'],
+                        'posted_at': inspected.get('posted_at') or record['posted_at'],
+                        'valid_through': inspected.get('valid_through') or '',
+                        'url': inspected.get('url') or record['url'],
+                        'ats_family': inspected.get('ats_family') or record['ats_family'],
+                        'extraction_status': inspected.get('extraction_status'),
+                    })
+                elif inspected.get('extraction_status') == 'manual_fallback':
+                    record['ats_family'] = inspected.get('ats_family') or record['ats_family']
+                    record['extraction_status'] = 'manual_fallback'
+                    record['fallback_reason'] = str(inspected.get('reason') or '')
+
+            results.append(record)
+        return results
+
+    def search(self, filters: dict[str, Any]) -> list[dict[str, Any]]:
+        """Discover public jobs across ATS boards and optional Serper search, deduplicated with D1 preflight."""
+        query = str(filters.get('query') or '').strip()
+        location = str(filters.get('location') or '').strip()
+        raw_limit = filters.get('limit', 15)
+        try:
+            limit = max(1, min(int(raw_limit), 50))
+        except (TypeError, ValueError):
+            limit = 15
+
+        raw_boards = filters.get('boards')
+        if raw_boards is None:
+            raw_boards = self._config.get('discovery_boards') or []
+        if isinstance(raw_boards, str):
+            board_items = [part.strip() for part in raw_boards.split(',') if part.strip()]
+        elif isinstance(raw_boards, Iterable):
+            board_items = [item for item in raw_boards if item]
+        else:
+            board_items = []
+
+        include_serper = bool(filters.get('include_serper', True))
+        hydrate_urls = bool(filters.get('hydrate_urls', True))
+
+        query_tokens = _tokenize_search_terms(query)
+        location_tokens = _tokenize_search_terms(location)
+        candidates: list[tuple[int, dict[str, Any]]] = []
+        board_errors: list[str] = []
+        sources_queried: list[str] = []
+
+        for spec in board_items:
+            try:
+                ats, board = parse_board_spec(spec)
+                sources_queried.append(f'{ats}:{board}')
+                for posting in self._fetch_ats_board(ats, board):
+                    matched, score = _matches_search_filters(posting, query_tokens, location_tokens)
+                    if matched:
+                        candidates.append((score + 5, posting))
+            except Exception as exc:
+                board_errors.append(_redact_secrets(str(exc), [self._env.get('SEARCH_API_KEY', '')]))
+
+        serper_used = False
+        serper_error = ''
+        if include_serper and self._env.get('SEARCH_API_KEY', '').strip() and query:
+            sources_queried.append('serper')
+            serper_used = True
+            try:
+                serper_hits = self._search_serper(query, location, limit=min(limit, 10), hydrate_urls=hydrate_urls)
+                for hit in serper_hits:
+                    bonus = 3 if hit.get('extraction_status') == 'verified' else 1
+                    candidates.append((bonus, hit))
+            except JobDiscoveryError as exc:
+                serper_error = str(exc)
+
+        candidates.sort(key=lambda pair: pair[0], reverse=True)
+
+        deduped: list[dict[str, Any]] = []
+        seen_urls: set[str] = set()
+        seen_title_company: set[tuple[str, str]] = set()
+        for _, item in candidates:
+            url_key = normalize_job_url(item.get('url', ''))
+            title_key = str(item.get('title') or '').strip().lower()
+            company_key = str(item.get('company') or '').strip().lower()
+            tc_key = (company_key, title_key) if company_key and title_key else None
+
+            if url_key and url_key in seen_urls:
+                continue
+            if tc_key and tc_key in seen_title_company:
+                continue
+            if url_key:
+                seen_urls.add(url_key)
+            if tc_key:
+                seen_title_company.add(tc_key)
+
+            preflight = self.preflight_job(item)
+            enriched = dict(item)
+            enriched['origin'] = 'discovered'
+            enriched['ats_family'] = preflight.ats_family
+            enriched['preflight'] = engine.preflight_storage_dict(preflight.__dict__)
+            deduped.append(enriched)
+            if len(deduped) >= limit:
+                break
+
+        self.last_metadata = {
+            'sources_queried': sources_queried,
+            'board_errors': board_errors,
+            'serper_used': serper_used,
+            'serper_error': serper_error,
+            'total_candidates': len(candidates),
+            'deduped_count': len(deduped),
+        }
+        return deduped
+
