@@ -3,5 +3,30 @@
 (function () {
   const mount = document.getElementById('outreachExtensions');
   if (!mount) return;
-  mount.innerHTML = '<p class="small"><strong>Networking & Inbox Extensions (Owner B):</strong> Artifact Contacts (D4), Authorized Email Send, Reply Classifier, and Callback Cheat Sheet Viewer mount here as tasks B-01..B-04 are completed.</p>';
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.textContent = 'Test inbox classification';
+  const result = document.createElement('pre');
+  result.setAttribute('aria-live', 'polite');
+  mount.append(button, result);
+
+  button.onclick = async () => {
+    button.disabled = true;
+    try {
+      const response = await fetch('/api/inbox/simulate', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: '{}',
+      });
+      if (!response.ok) throw new Error('Inbox simulation failed.');
+      const data = await response.json();
+      result.textContent = [data.mode, ...data.replies.map(
+        reply => reply.subject + ' — ' + reply.classification
+      )].join('\n');
+    } catch (error) {
+      result.textContent = error.message;
+    } finally {
+      button.disabled = false;
+    }
+  };
 })();

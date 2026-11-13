@@ -20,7 +20,7 @@
 ## Active File Locks & Blockers
 | File / Scope | Locked By | Task ID | Since | Notes |
 |---|---|---|---|---|
-| _None currently_ | — | — | — | Claim your scope before editing |
+| app/adapters_outreach.py, app/routes_outreach.py, prompts/outreach_prompt.md | Owner B | B-03 | 2026-11-13 | LLM drafting |
 
 **Current Blockers:** _None — Foundation (`S-01`) complete via `comms/handoffs/H-01-foundation-ready.md`._
 
@@ -45,11 +45,14 @@
 | `A-07` | Unit tests (`tests/test_pipeline.py`) + Live Submissions | `TODO` | `A-03` | `tests/test_pipeline.py` |
 
 ### Owner B Queue (`plans/OWNER_B_WORKBOOK.md`)
+
+QA (2026-11-13): 13/13 existing tests passed with local loopback access. Six skill mirrors matched. The `TEST ONLY` inbox simulation correctly classified all three fixture messages. Package validation passed on a clean local copy without `.env` or the local database. Computer B and live outreach remain unverified.
+
 | ID | Task | Status | Depends On | Target Files |
 |---|---|---|---|---|
-| `B-01` | Gmail OAuth primary + Outlook contract `OutreachAdapter` | `TODO` | `S-01` | `app/adapters_outreach.py`, `app/routes_outreach.py`, `web/outreach.js` |
-| `B-02` | `InboxAdapter` + Thread Reply Classifier + `fictional_inbox` sim | `TODO` | `S-01` (enhanced by `A-01` `H-02`) | `app/adapters_outreach.py`, `app/routes_outreach.py`, `web/outreach.js` |
-| `B-03` | **D4** Artifact-First Public Contact Research + 3-Sentence Anti-Flattery Drafts | `TODO` | `S-01`, `A-01` (`H-02`) | `app/adapters_outreach.py`, `app/routes_outreach.py`, `web/outreach.js` |
+| `B-01` | Gmail OAuth primary + Outlook contract `OutreachAdapter` | `IN_PROGRESS` | `S-01` | API and adapter implementation complete. 21 tests passed with mocked Google responses. Live OAuth and a provider-issued Gmail message ID remain to be verified with an authorized account. See the team handoff for setup. |
+| `B-02` | `InboxAdapter` + Thread Reply Classifier + `fictional_inbox` sim | `IN_PROGRESS` | `S-01` (enhanced by `A-01` `H-02`) | `app/adapters_outreach.py`, `app/routes_outreach.py`, `web/outreach.js` |
+| `B-03` | **D4** Artifact-First Public Contact Research + 3-Sentence Anti-Flattery Drafts | `IN_PROGRESS` | `S-01`, `A-01` (`H-02`) | `app/adapters_outreach.py`, `app/routes_outreach.py`, `web/outreach.js` |
 | `B-04` | Cooldown/Opt-Out Firewall + **D2** Callback Cheat Sheet Trigger UI | `TODO` | `B-02`, `A-05` (`H-03`) | `app/routes_outreach.py`, `web/outreach.js` |
 | `B-05` | Upgrade `skills/*/SKILL.md` + `prompts/*.md` + `sync_harness.py` | `TODO` | `A-05`, `B-04` | `skills/*/SKILL.md`, `prompts/*.md`, `.agents/skills/` |
 | `B-06` | Computer B Clean-Environment Portability Test + `TEAM_HANDOFF_TEMPLATE.md` | `TODO` | `A-07`, `B-05` | `deliverables/TEAM_HANDOFF_TEMPLATE.md` |
