@@ -20,7 +20,6 @@
 ## Active File Locks & Blockers
 | File / Scope | Locked By | Task ID | Since | Notes |
 |---|---|---|---|---|
-| _None currently_ | — | — | — | Claim your scope before editing |
 
 **Current Blockers:** _None — Foundation (`S-01`) complete via `comms/handoffs/H-01-foundation-ready.md`._
 
@@ -36,7 +35,7 @@
 ### Owner A Queue (`plans/OWNER_A_WORKBOOK.md`)
 | ID | Task | Status | Depends On | Target Files |
 |---|---|---|---|---|
-| `A-01` | Unified `ModelAdapter` (OpenAI/Gemini/Anthropic) + `ResumeFileAdapter` (PDF/DOCX) | `TODO` | `S-01` | `app/adapters_pipeline.py`, `app/routes_pipeline.py`, `web/pipeline.js` |
+| `A-01` | Unified `ModelAdapter` (OpenAI/Gemini/Anthropic) + `ResumeFileAdapter` (PDF/DOCX) | `DONE` | `S-01` | `app/adapters_pipeline.py`, `app/routes_pipeline.py`, `web/pipeline.js`, `tests/test_pipeline.py` · See `comms/handoffs/H-02-model-resume-adapters.md` |
 | `A-02` | `JobDiscoveryAdapter` (Greenhouse/Lever/Ashby) + **D1** Pre-Flight Shield | `TODO` | `A-01` | `app/engine.py`, `app/adapters_pipeline.py`, `app/routes_pipeline.py`, `web/pipeline.js` |
 | `A-03` | **D3** Co-Pilot Packet + Sensitive-Field Gate + SHA-256 Receipts | `TODO` | `A-01` | `app/adapters_pipeline.py`, `app/routes_pipeline.py`, `web/pipeline.js` |
 | `A-04` | **D2** Voice-Preserving Anti-Slop Tailor + ATS Plain-Text Preview | `TODO` | `A-01` | `app/engine.py`, `app/adapters_pipeline.py`, `web/pipeline.js` |
@@ -45,12 +44,15 @@
 | `A-07` | Unit tests (`tests/test_pipeline.py`) + Live Submissions | `TODO` | `A-03` | `tests/test_pipeline.py` |
 
 ### Owner B Queue (`plans/OWNER_B_WORKBOOK.md`)
+
+QA (2026-11-13): 13/13 existing tests passed with local loopback access. Six skill mirrors matched. The `TEST ONLY` inbox simulation correctly classified all three fixture messages. Package validation passed on a clean local copy without `.env` or the local database. Computer B and live outreach remain unverified.
+
 | ID | Task | Status | Depends On | Target Files |
 |---|---|---|---|---|
-| `B-01` | Gmail OAuth primary + Outlook contract `OutreachAdapter` | `TODO` | `S-01` | `app/adapters_outreach.py`, `app/routes_outreach.py`, `web/outreach.js` |
-| `B-02` | `InboxAdapter` + Thread Reply Classifier + `fictional_inbox` sim | `TODO` | `S-01` (enhanced by `A-01` `H-02`) | `app/adapters_outreach.py`, `app/routes_outreach.py`, `web/outreach.js` |
-| `B-03` | **D4** Artifact-First Public Contact Research + 3-Sentence Anti-Flattery Drafts | `TODO` | `S-01`, `A-01` (`H-02`) | `app/adapters_outreach.py`, `app/routes_outreach.py`, `web/outreach.js` |
-| `B-04` | Cooldown/Opt-Out Firewall + **D2** Callback Cheat Sheet Trigger UI | `TODO` | `B-02`, `A-05` (`H-03`) | `app/routes_outreach.py`, `web/outreach.js` |
-| `B-05` | Upgrade `skills/*/SKILL.md` + `prompts/*.md` + `sync_harness.py` | `TODO` | `A-05`, `B-04` | `skills/*/SKILL.md`, `prompts/*.md`, `.agents/skills/` |
-| `B-06` | Computer B Clean-Environment Portability Test + `TEAM_HANDOFF_TEMPLATE.md` | `TODO` | `A-07`, `B-05` | `deliverables/TEAM_HANDOFF_TEMPLATE.md` |
-| `B-07` | Unit tests (`tests/test_outreach.py`) + Live Outreach | `TODO` | `B-01`, `B-04` | `tests/test_outreach.py` |
+| `B-01` | Gmail OAuth primary + Outlook contract `OutreachAdapter` | `DONE` | `S-01` | 21 tests passed. On 2026-11-13, desktop OAuth completed and Gmail returned a message ID for one approved test sent through the adapter to a user-controlled inbox. The test is excluded from the outreach scoreboard. |
+| `B-02` | `InboxAdapter` + Thread Reply Classifier + `fictional_inbox` sim | `DONE` | `S-01` | All three offline fixtures classified correctly. 24 tests passed, including simulated Gmail sync and deduplication. Live Gmail sync awaits separate read-only OAuth. |
+| `B-03` | **D4** Artifact-First Public Contact Research + 3-Sentence Anti-Flattery Drafts | `IN_PROGRESS` | `S-01`, `A-01` (`H-02`) | Public employer JSON-LD research, source cards, manual queries and artifact drafts implemented. H-02 integrated. Live Gemini artifact drafting passed with synthetic data. Live contact-source verification pending. |
+| `B-04` | Cooldown/Opt-Out Firewall + **D2** Callback Cheat Sheet Trigger UI | `IN_PROGRESS` | `B-02`, `A-05` (`H-03`) | Opt-out and configurable cooldown tested. User links replies to confirmed applications. Exact snapshot tested with fixture. H-03 live snapshot producer pending. |
+| `B-05` | Upgrade `skills/*/SKILL.md` + `prompts/*.md` + `sync_harness.py` | `IN_PROGRESS` | `A-05`, `B-04` | Six skills and prompts updated. Mirrors and ZIPs verified. Second harness execution pending. |
+| `B-06` | Computer B Clean-Environment Portability Test + `TEAM_HANDOFF_TEMPLATE.md` | `IN_PROGRESS` | `A-07`, `B-05` | Release ZIP inspected and extracted locally. Package validation and 42 tests passed after A-01 integration, including PDF/DOCX fixtures. Computer B and independent review pending. |
+| `B-07` | Unit tests (`tests/test_outreach.py`) + Live Outreach | `IN_PROGRESS` | `B-01`, `B-04` | Outreach tests cover opt-out, cooldown, deduplication, auto-receipts and artifact validation. Approved recruiting outreach remains 0/10. |

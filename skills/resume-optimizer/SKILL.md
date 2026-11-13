@@ -27,3 +27,7 @@ If the needed website, email provider, AI model or file tool is not connected or
 
 ## Related resources
 See `../../prompts/system_prompt.md`, `../../docs/SECURITY_AND_CONSENT.md`, and `../../schemas/` in the full project distribution.
+
+## Differentiator workflow
+
+For D2, preserve the candidate’s voice, attach exact source excerpts to revised claims, and review the linear ATS text before approval. For D5, distinguish wording gaps from missing skills and require verified proof before adding a new claim.

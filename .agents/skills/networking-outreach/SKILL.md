@@ -27,3 +27,7 @@ If the needed website, email provider, AI model or file tool is not connected or
 
 ## Related resources
 See `../../prompts/system_prompt.md`, `../../docs/SECURITY_AND_CONSENT.md`, and `../../schemas/` in the full project distribution.
+
+## Differentiator workflow
+
+For D4, check opt-out and employer cooldown before drafting and sending. Draft three brief sentences grounded in the contact artifact and verified candidate evidence. Require recipient and message approval and retain the provider ID or user-reported manual outcome.

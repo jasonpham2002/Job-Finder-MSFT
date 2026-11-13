@@ -27,3 +27,7 @@ If the needed website, email provider, AI model or file tool is not connected or
 
 ## Related resources
 See `../../prompts/system_prompt.md`, `../../docs/SECURITY_AND_CONSENT.md`, and `../../schemas/` in the full project distribution.
+
+## Differentiator workflow
+
+For D3, stage answers in portal order and require the candidate to supply sensitive answers. Preserve the approved resume and answers, record hashes and external confirmation evidence, and save the D2 callback snapshot for confirmed applications.
