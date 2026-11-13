@@ -1,29 +1,29 @@
 # Team Handoff — Fill This Out Before You Submit
 
-Team name: __________
-Repository / project version: __________
-Primary AI provider: __________
-Other supported AI providers: __________
+Team name: JobFinder MSFT (Owner A + Owner B)
+Repository / project version: JobFinder_Hackathon_4 v1.0 (Tasks A-01..A-07 & B-01..B-07 integrated)
+Primary AI provider: Google Gemini (`gemini-3.8-flash` via Interactions API)
+Other supported AI providers: OpenAI (`gpt-4o-mini` / Responses & Chat Completions), Anthropic (`claude-3-5-sonnet-latest` / Messages tool-forced JSON), plus deterministic offline fallback
 
 ## Setup
 
-Supported OS: __________
-Required runtime versions: __________
-Install command: __________
-Start command: __________
-Required environment variables (NAMES ONLY, NO SECRETS): __________
-Required account permissions/plan/API billing: __________
+Supported OS: macOS, Linux, Windows
+Required runtime versions: Python 3.11+ (zero-dependency standard-library runtime; Node.js optional for JS syntax check)
+Install command: `python3 -m pip install pypdf google-auth-oauthlib playwright` (all optional; core server, DOCX/PDF/TXT parser, and offline demo run with Python standard library alone)
+Start command: `python3 -m app.server` (opens `http://127.0.0.1:8765`)
+Required environment variables (NAMES ONLY, NO SECRETS): `JOBFINDER_LLM_PROVIDER`, `JOBFINDER_LLM_MODEL`, `GEMINI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `SEARCH_API_KEY`, `GMAIL_OAUTH_CLIENT_ID`, `GMAIL_OAUTH_CLIENT_SECRET`, `OUTLOOK_CLIENT_ID`, `OUTLOOK_TENANT_ID`, `JOBFINDER_PORT`, `JOBFINDER_LLM_OUTREACH`
+Required account permissions/plan/API billing: Free or paid API key for chosen LLM provider (`GEMINI_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`), optional Serper API key (`SEARCH_API_KEY`), and Google Cloud Desktop OAuth client for Gmail send (`gmail.send`) and read-only inbox sync (`gmail.readonly`)
 
 ## Integrations (real/test/manual)
 
-Job sources supported: __________
-Job-page extraction techniques: __________
-PDF/DOCX parser: __________
-Application destination(s) and authorization model: __________
-Professional contact research source(s): __________
-Email sending provider: __________
-LinkedIn messaging approach (manual/authorized): __________
-Response monitoring provider: __________
+Job sources supported: Public Greenhouse, Lever, and Ashby board JSON APIs, optional Serper web search (`SEARCH_API_KEY`), arbitrary public company career URLs (`schema.org/JobPosting` + HTML), and manual JD paste fallback for login/anti-bot-gated sites (LinkedIn/Indeed/Workday)
+Job-page extraction techniques: SSRF-validated public HTTP fetcher + ATS API adapters (Greenhouse/Lever/Ashby) + `schema.org/JobPosting` JSON-LD + HTML text extractor + D1 Pre-Flight Shield (ATS family, liveness, scam/reference-harvesting detector, friction-ROI badge)
+PDF/DOCX parser: `LocalResumeFileAdapter` supporting `.docx` (`zipfile` + `word/document.xml`), `.pdf` (`pypdf` when installed + stdlib zlib Flate stream fallback), and `.txt`, with zip-bomb/size limits and D2 ATS plain-text linearization preview
+Application destination(s) and authorization model: D3 Human-Assist Co-Pilot Packet (portal-ordered fields + hard-locked sensitive fields + SHA-256 tamper-evident receipts) + A-06 Optional Headed Playwright HITL Autofill (`enable_playwright_hitl` + `explicit_user_approval=True`; fills non-sensitive fields only and pauses for human review & submit)
+Professional contact research source(s): D4 `PublicArtifactContactAdapter` extracting `schema.org/Person` JSON-LD, public HTML team bio cards, and blog author metadata from employer-published URLs (plus user-verified excerpt entry and manual search query fallback)
+Email sending provider: `GmailOutreachAdapter` via Desktop OAuth (`~/.jobfinder/gmail-outreach.json`) with `explicit_user_approval=True`, `review_token`, and `message_sha256` verification; `OutlookOutreachAdapter` and `ManualOutreachAdapter` manual fallback
+LinkedIn messaging approach (manual/authorized): Strictly manual copy-paste after explicit user approval, with user-reported `manual_sent` confirmation timestamp (zero automated LinkedIn scraping or sending)
+Response monitoring provider: `GmailInboxAdapter` syncing messages labeled `JobFinder` (`gmail.readonly` via `~/.jobfinder/gmail-inbox.json`), deduplicating by `provider_message_id`, classifying via `classify_reply`, and triggering Owner A's D2 30-second Callback Cheat Sheet drawer; offline `POST /api/inbox/simulate` (`TEST ONLY`) included
 
 ## Evidence
 
@@ -36,16 +36,16 @@ Demo evidence: one approved Gmail integration email to a user-controlled inbox. 
 
 ## Portability
 
-Verified clean-environment setup: local extraction, package validation and 42 automated tests passed, including PDF/DOCX fixtures. Computer B remains pending.
+Verified clean-environment setup: local extraction, package validation and 67 automated tests passed, including PDF/DOCX fixtures, D1-D5 pipeline tests, A-06 HITL + A-07 readiness scorecard, and B-01..B-07 outreach/inbox tests. Computer B remains pending.
 Skill ZIP files included: yes, six individual archives and one combined archive.
-Second AI harness or provider: pending.
-Items needing re-authentication: Gmail send and Gmail inbox read scopes use separate desktop OAuth credentials.
-Known limitations: PDF/DOCX fixture coverage passed with the integrated A-01 adapter. Real application confirmation depends on Owner A. Live Gmail inbox sync still needs read-only OAuth verification.
+Second AI harness or provider: Antigravity (`skills/`) + OpenAI Codex (`.agents/skills/` synchronized via `scripts/sync_harness.py`) + Claude (`CLAUDE.md`).
+Items needing re-authentication: Gmail send and Gmail inbox read scopes use separate desktop OAuth credentials (`~/.jobfinder/gmail-outreach.json` and `~/.jobfinder/gmail-inbox.json`).
+Known limitations: Live applications (`0/10`) and live recruiting outreach (`0/10`) require human candidate execution and external confirmation IDs. Live Gmail inbox sync requires separate `authorize-gmail-inbox` OAuth consent.
 
 ## Current Scaffold Baseline (Honesty Status)
 
-- **Real / Live today:** Local HTTP dashboard (`127.0.0.1:8765`), SSRF-checked public HTML + `schema.org/JobPosting` parser with manual paste fallback, SQLite persistence with idempotent migrations, typed adapter & schema contracts (`D1`–`D5`), modular Owner A/B route & UI seams, and portable `SKILL.md` packaging.
-- **Test / Stubbed today (update above before final judging):** `ModelAdapter`, PDF/DOCX `ResumeFileAdapter`, `JobDiscoveryAdapter`, `ApplicationAdapter` real submissions, and `ProfessionalContactAdapter` remain offline/stubbed.
+- **Real / Live today:** Local HTTP dashboard (`127.0.0.1:8765`), `UnifiedModelAdapter` (Gemini/OpenAI/Anthropic), `LocalResumeFileAdapter` (PDF/DOCX/TXT + ATS preview), `LiveJobDiscoveryAdapter` (Greenhouse/Lever/Ashby + Serper + D1 Pre-Flight Shield), `VoicePreservingTailorAdapter` (D2 claim-evidence map + anti-slop linter), `GapBridgeAdapter` (D5 wording vs. true skill gaps + proof verification), `CoPilotApplicationAdapter` + `PlaywrightHITLHelper` (D3 Co-Pilot packets, SHA-256 receipts, A-06 optional headed autofill, A-07 10-job batch & readiness scorecard), `PublicArtifactContactAdapter` (D4 JSON-LD + HTML bio/blog extractor), `GmailOutreachAdapter` (B-01 OAuth send + cooldown/opt-out firewall), and `GmailInboxAdapter` (B-02 reply sync/classification + B-04 D2 Callback Cheat Sheet drawer).
+- **Requires user credentials / human action for live counts:** Live LLM calls require an API key in `.env`; live Gmail send/sync requires running desktop OAuth; real application (`confirmed`) and outreach (`sent`) scoreboard counts strictly require human review, approval, and external confirmation IDs.
 - **B-01 email delivery:** Gmail supports authorized delivery through the local API. Automated tests mock Google. On 2026-11-13, desktop OAuth and one approved Gmail test send through the adapter returned a real message ID. The recipient was a user-controlled inbox, so this test is excluded from the outreach scoreboard. Outlook and LinkedIn use manual copy/paste. A user-reported `manual_sent` is tracked separately from Gmail sends with a provider message ID.
 
 ### B-01 local setup and API

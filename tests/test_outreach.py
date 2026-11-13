@@ -215,3 +215,83 @@ class OutreachRouteTests(unittest.TestCase):
         self.assertTrue(result['sent_at'])
         self.assertEqual(db.row('SELECT provider_message_id FROM outreach')['provider_message_id'], '')
         provider.assert_not_called()
+
+    def test_html_and_blog_contact_extraction_and_redirect_guard(self):
+        adapter = PublicArtifactContactAdapter()
+        job = {'source_url': 'https://company.com/team', 'company': 'Test Company'}
+        team_html = '''
+        <html><head><title>Test Company Team</title></head><body>
+          <article>
+            <h3>Jordan Lee</h3>
+            <p>Senior Technical Recruiter</p>
+            <p>Leads university and distributed systems recruiting across Test Company.</p>
+            <a href="mailto:jordan@company.com">Email</a>
+          </article>
+        </body></html>
+        '''
+        extracted = adapter.extract_html_contacts(job, team_html)
+        self.assertEqual(len(extracted), 1)
+        self.assertEqual(extracted[0].name, 'Jordan Lee')
+        self.assertEqual(extracted[0].professional_email, 'jordan@company.com')
+        self.assertEqual(extracted[0].artifact_hook['type'], 'team_bio')
+
+        blog_html = '''
+        <html><head>
+          <title>Scaling Python Services at Test Company</title>
+          <meta name="author" content="Morgan Chen">
+          <meta name="description" content="How our Staff Engineer team improved reliability across Test Company.">
+        </head><body><p>Test Company engineering blog post by Staff Engineer Morgan Chen.</p></body></html>
+        '''
+        blog_contacts = adapter.extract_html_contacts(job, blog_html)
+        self.assertEqual(len(blog_contacts), 1)
+        self.assertEqual(blog_contacts[0].name, 'Morgan Chen')
+        self.assertEqual(blog_contacts[0].artifact_hook['type'], 'blog_post')
+
+    def test_manual_contact_excerpt_and_overlap_grounded_artifact_draft(self):
+        with db.connection() as con:
+            con.execute(
+                'UPDATE jobs SET description=? WHERE id=?',
+                ('Build Python and SQL data services and REST APIs for enterprise customers.', self.job_id),
+            )
+        _, status = handle_get('/api/networking/status')
+        self.assertTrue(status['implemented'])
+        with patch.object(PublicArtifactContactAdapter, 'research', return_value=[]):
+            code, res = handle_post('/api/networking/contacts/research', {
+                'job_id': self.job_id,
+                'source_url': 'https://company.com/about',
+                'employer_source_confirmed': True,
+                'sync_token': status['sync_token'],
+                'manual_contact': {
+                    'name': 'Alex Rivera',
+                    'role': 'Engineering Manager',
+                    'artifact_type': 'team_bio',
+                    'artifact_snippet': 'Alex Rivera leads the Python & SQL platform team at Test Company.',
+                    'public_email': 'alex@company.com',
+                },
+            })
+        self.assertEqual(code, 200)
+        self.assertEqual(len(res['contacts']), 1)
+        contact_id = res['contacts'][0]['id']
+        code, draft = handle_post('/api/networking/contacts/draft', {'contact_id': contact_id, 'channel': 'email'})
+        self.assertEqual(code, 200)
+        self.assertIn('https://company.com/about', draft['body'])
+        self.assertEqual(draft['recipient'], 'alex@company.com')
+        self.assertEqual(draft['contact_name'], 'Alex Rivera')
+        self.assertEqual(handle_get('/api/networking/contacts')[1]['contacts'][0]['name'], 'Alex Rivera')
+
+    def test_expanded_reply_classifier_and_simulated_callback_preview(self):
+        self.assertEqual(
+            classify_reply('recruiter@company.com', 'Re: Engineer role', 'Thanks for reaching out — happy to chat next week!'),
+            'human_positive_reply',
+        )
+        self.assertEqual(
+            classify_reply('recruiter@company.com', 'Re: Engineer role', 'Are you free for a quick call on Tuesday?'),
+            'human_positive_reply',
+        )
+        _, sim = handle_post('/api/inbox/simulate', {})
+        self.assertEqual(sim['mode'], 'TEST ONLY')
+        pos = sim['replies'][0]
+        self.assertEqual(pos['classification'], 'human_positive_reply')
+        self.assertIn('callback_packet', pos)
+        self.assertEqual(pos['callback_packet']['mode'], 'TEST ONLY')
+        self.assertTrue(pos['callback_packet']['probe_questions'])

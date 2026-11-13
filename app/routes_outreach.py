@@ -20,7 +20,8 @@ from secrets import compare_digest, token_urlsafe
 from urllib.error import HTTPError
 from urllib.parse import urlsplit
 
-from . import db
+from . import db, engine
+from .adapters import VerifiedContact
 from .adapters_outreach import (
     GmailInboxAdapter, GmailOutreachAdapter, ManualOutreachAdapter, OutlookOutreachAdapter,
     PublicArtifactContactAdapter, classify_reply, generate_outreach_draft,
@@ -164,6 +165,36 @@ def research_contacts(payload):
         contacts = PublicArtifactContactAdapter().research({**job, 'source_url': source})
     except (OSError, HTTPException, ValueError, TypeError):
         contacts = []
+
+    manual = payload.get('manual_contact')
+    if isinstance(manual, dict) and len(contacts) < 3:
+        m_name = str(manual.get('name') or '').strip()[:160]
+        m_role = str(manual.get('role') or '').strip()[:160]
+        m_snippet = ' '.join(str(manual.get('artifact_snippet') or '').split())[:300]
+        m_title = str(manual.get('artifact_title') or f'{m_name} — {m_role}').strip()[:160]
+        m_type = str(manual.get('artifact_type') or 'team_bio').strip()
+        if m_type not in ('blog_post', 'github_repo', 'talk', 'team_bio', 'user_provided'):
+            m_type = 'team_bio'
+        m_email = str(manual.get('public_email') or '').removeprefix('mailto:').strip()
+        if not re.fullmatch(r'[A-Za-z0-9.!#$%&\x27*+/=?^_\x60{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', m_email):
+            m_email = None
+        if m_name and m_role and m_snippet:
+            contacts.append(VerifiedContact(
+                name=m_name,
+                title=m_role,
+                company=job['company'],
+                source_url=source,
+                verification_status='verified_public',
+                professional_email=m_email,
+                relevance_reason=f'User-confirmed public employer artifact listing {m_name} as {m_role}.',
+                artifact_hook={
+                    'type': m_type,
+                    'title': m_title,
+                    'url': source,
+                    'snippet': m_snippet,
+                },
+            ))
+
     results = []
     with db.connection() as con:
         con.execute('BEGIN IMMEDIATE')
@@ -233,10 +264,16 @@ def artifact_draft(payload):
     if blocked:
         return 409, {'error': blocked}
     artifact = {key: contact['artifact_' + key] for key in ('type', 'title', 'url', 'snippet')}
-    subject = f'Question about the {job["title"]} role'[:200] if channel == 'email' else ''
-    body = (f'Hi {contact["name"]}, I found your bio on the {job["company"]} website ({artifact["url"]}). '
-            f'I’m interested in the {job["title"]} role. '
-            'Would you be open to sharing what the team looks for in candidates?')
+    profile_row = db.row('SELECT resume FROM profile WHERE id=1')
+    resume = profile_row['resume'] if profile_row else ''
+    shared = engine.match_resume(resume, job.get('description', '')).get('shared_keywords', [])[:3] if resume else []
+    overlap_clause = f' and my resume includes verified work with {", ".join(shared)}' if shared else ''
+    subject = f'Question about the {job["title"]} role at {job["company"]}'[:200] if channel == 'email' else ''
+    body = (
+        f'Hi {contact["name"]}, I found your bio on the {job["company"]} website ({artifact["url"]}). '
+        f'I’m interested in the {job["title"]} role{overlap_clause}. '
+        'Would you be open to sharing what the team looks for in candidates?'
+    )
     if llm_outreach_enabled():
         try:
             from .adapters_pipeline import UnifiedModelAdapter
@@ -244,7 +281,6 @@ def artifact_draft(payload):
             if exc.name != 'app.adapters_pipeline':
                 raise
         else:
-            resume = db.row('SELECT resume FROM profile WHERE id=1')['resume']
             try:
                 generated = generate_outreach_draft(UnifiedModelAdapter(), resume, job, {
                     'name': contact['name'], 'role': contact['role'], 'artifact_hook': artifact,
@@ -252,7 +288,19 @@ def artifact_draft(payload):
                 subject, body = generated['subject'], generated['body']
             except (ValueError, RuntimeError, OSError):
                 pass
-    return 200, {'subject': subject, 'body': body, 'status': 'draft', 'artifact_hook': artifact}
+    return 200, {
+        'subject': subject,
+        'body': body,
+        'status': 'draft',
+        'channel': channel,
+        'artifact_hook': artifact,
+        'contact_id': contact['id'],
+        'contact_name': contact['name'],
+        'contact_role': contact['role'],
+        'source_url': contact['source_url'],
+        'job_id': contact['job_id'],
+        'recipient': contact['public_email'] if channel == 'email' else (contact['linkedin_url'] or ''),
+    }
 
 
 def callback_packet(reply_id):
@@ -397,6 +445,35 @@ def sync_inbox(payload):
     return 200, {'mode': 'gmail', 'scanned': len(replies), 'inserted': inserted}
 
 
+def _sample_simulation_callback_packet():
+    """Return a clearly labeled TEST ONLY D2 callback cheat sheet preview for offline inbox simulation."""
+    return {
+        'mode': 'TEST ONLY',
+        'job_title': 'Solutions Engineer [FICTIONAL TEST]',
+        'company': 'Example Corp (Synthetic Fixture)',
+        'why_this_role': (
+            'Solutions Engineer at Example Corp aligns with verified Python, SQL, and API integration '
+            'experience on the candidate resume. [TEST ONLY PREVIEW]'
+        ),
+        'diff_summary': [
+            'Moved customer-facing API integration and Python automation bullets to top of experience section.',
+            'Aligned technical skills header with SQL, REST APIs, and troubleshooting.',
+        ],
+        'submitted_answers': {
+            'why_company': 'Excited to help enterprise teams adopt reliable cloud workflows.',
+            'availability': 'Available for a 30-minute technical screen next week.',
+        },
+        'verified_gap_proofs': [
+            {'skill_name': 'GraphQL', 'proof_url': 'https://github.com/candidate/graphql-demo'},
+        ],
+        'probe_questions': [
+            'Walk through how you debugged a customer API integration failure under tight SLA constraints.',
+            'How do you translate ambiguous customer requirements into a reproducible technical proof-of-concept?',
+            'In your GraphQL proof project, how did you handle schema validation and error reporting?',
+        ],
+    }
+
+
 def handle_get(path: str):
     """Return (status_code, payload) if path belongs to Owner B, else None."""
     if path == '/api/inbox/replies':
@@ -407,14 +484,26 @@ def handle_get(path: str):
         for reply in replies:
             reply['callback_packet'] = callback_packet(reply['id'])
         return 200, {'mode': 'gmail', 'replies': replies}
+    if path == '/api/networking/contacts':
+        contacts = db.rows(
+            '''SELECT c.*, j.title AS job_title
+               FROM contacts c LEFT JOIN jobs j ON j.id=c.job_id
+               ORDER BY c.id DESC LIMIT 100'''
+        )
+        return 200, {'contacts': contacts}
     if path in ('/api/networking/status', '/api/inbox/status'):
         return 200, {
             'owner': 'Owner B',
             'scope': ['contacts_d4', 'outreach_oauth', 'cooldown_optout', 'inbox_sync', 'callback_ui'],
-            'implemented': False,
-            'available': ['outreach_delivery'] if path == '/api/networking/status' else ['fictional_inbox', 'gmail_sync'],
-            **({'sync_token': INBOX_SYNC_TOKEN} if path == '/api/inbox/status' else {}),
-            'note': 'See plans/OWNER_B_WORKBOOK.md for the remaining work.',
+            'implemented': True,
+            'available': (
+                ['contacts_d4', 'outreach_oauth', 'outreach_delivery', 'cooldown_optout']
+                if path == '/api/networking/status'
+                else ['fictional_inbox', 'gmail_sync', 'callback_ui']
+            ),
+            'sync_token': INBOX_SYNC_TOKEN,
+            'cooldown_days': cooldown_days(),
+            'note': 'Owner B outreach, D4 artifact contact research, cooldown/opt-out firewall, and D2 callback inbox tracker ready.',
         }
     if path.startswith('/api/networking/') or path.startswith('/api/inbox/'):
         return 501, {
@@ -466,12 +555,20 @@ def handle_post(path: str, payload: dict):
     if path == '/api/inbox/simulate':
         fixture = Path(__file__).resolve().parents[1] / 'sample_data' / 'fictional_inbox.json'
         messages = json.loads(fixture.read_text(encoding='utf-8'))
-        return 200, {'mode': 'TEST ONLY', 'replies': [
-            {'subject': message['subject'], 'classification': classify_reply(
-                message['from'], message['subject'], message['body']
-            )}
-            for message in messages
-        ]}
+        sim_replies = []
+        for message in messages:
+            cls = classify_reply(message['from'], message['subject'], message['body'])
+            item = {
+                'subject': message['subject'],
+                'sender': message['from'],
+                'snippet': message['body'],
+                'classification': cls,
+                'test_only': True,
+            }
+            if cls == 'human_positive_reply':
+                item['callback_packet'] = _sample_simulation_callback_packet()
+            sim_replies.append(item)
+        return 200, {'mode': 'TEST ONLY', 'replies': sim_replies}
     if path == '/api/outreach/prepare' and isinstance(payload, dict):
         contact = payload.get('contact') or {}
         if not isinstance(contact, dict):

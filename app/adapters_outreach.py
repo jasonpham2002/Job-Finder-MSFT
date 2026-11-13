@@ -142,25 +142,67 @@ class OutlookOutreachAdapter(ManualOutreachAdapter):
 PROMPT = Path(__file__).resolve().parents[1] / 'prompts' / 'outreach_prompt.md'
 
 
+_ROLE_KEYWORDS_RE = re.compile(
+    r'\b(?:Recruiter|Recruiting|Talent\s+Acquisition|People\s+Partner|Hiring\s+Manager|'
+    r'Engineering\s+Manager|Software\s+Engineer|Staff\s+Engineer|Principal\s+Engineer|'
+    r'Senior\s+Engineer|Solutions\s+Engineer|Developer|Director\s+of\s+Engineering|'
+    r'VP\s+of\s+Engineering|Head\s+of\s+Engineering|Tech\s+Lead|Team\s+Lead|'
+    r'Research\s+Scientist|Data\s+Scientist|Product\s+Manager|CTO|Co-Founder|Founder)\b',
+    re.IGNORECASE,
+)
+_EMAIL_RE = re.compile(r'[A-Za-z0-9.!#$%&\x27*+/=?^_\x60{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}')
+
+
+def _validate_non_prohibited_public_url(url: str) -> str:
+    from .engine import valid_public_url
+
+    parsed = parse.urlsplit(url)
+    host = (parsed.hostname or '').rstrip('.').casefold()
+    if any(host == site or host.endswith('.' + site) for site in ('linkedin.com', 'indeed.com')):
+        raise ValueError('Use a public employer page or paste professional evidence.')
+    valid_public_url(url)
+    return url
+
+
 class PublicArtifactContactAdapter(ProfessionalContactAdapter):
     """Extract explicitly attributed people from public employer pages."""
 
     def research(self, job):
-        from .engine import JobParser, valid_public_url
+        from .engine import JobParser
 
-        source = job['source_url']
-        parsed = parse.urlsplit(source)
-        host = (parsed.hostname or '').rstrip('.').casefold()
-        if any(host == site or host.endswith('.' + site) for site in ('linkedin.com', 'indeed.com')):
-            raise ValueError('Use a public employer page or paste professional evidence.')
-        valid_public_url(source)
-        req = request.Request(source, headers={'Accept': 'text/html', 'User-Agent': 'JobFinder/1.0'})
-        with request.build_opener(NoProviderRedirects()).open(req, timeout=8) as response:
-            if response.headers.get_content_type() != 'text/html':
-                raise ValueError('The source must be a public employer HTML page.')
-            parser = JobParser()
-            parser.feed(response.read(500_000).decode('utf8', errors='replace'))
-        return self.extract(job, parser.job_ld)
+        current = _validate_non_prohibited_public_url(job['source_url'])
+        opener = request.build_opener(NoProviderRedirects())
+        raw_html = ''
+        for _ in range(4):
+            req = request.Request(
+                current,
+                headers={'Accept': 'text/html,application/xhtml+xml', 'User-Agent': 'JobFinder/1.0'},
+            )
+            try:
+                with opener.open(req, timeout=8) as response:
+                    ctype = (response.headers.get_content_type() or '').lower()
+                    if ctype not in ('text/html', 'application/xhtml+xml'):
+                        raise ValueError('The source must be a public employer HTML page.')
+                    raw_html = response.read(500_000).decode('utf8', errors='replace')
+                    break
+            except error.HTTPError as exc:
+                if exc.code in (301, 302, 303, 307, 308):
+                    location = exc.headers.get('Location') if exc.headers else None
+                    if not location:
+                        raise ValueError('Redirect missing Location header.') from exc
+                    current = _validate_non_prohibited_public_url(parse.urljoin(current, location))
+                    continue
+                raise
+        else:
+            raise ValueError('Too many redirects while fetching public employer source.')
+
+        parser = JobParser()
+        parser.feed(raw_html)
+        effective_job = {**job, 'source_url': current}
+        extracted = self.extract(effective_job, parser.job_ld)
+        if extracted:
+            return extracted
+        return self.extract_html_contacts(effective_job, raw_html, parser)
 
     def extract(self, job, nodes):
         contacts = {}
@@ -191,7 +233,7 @@ class PublicArtifactContactAdapter(ProfessionalContactAdapter):
                 continue
             email = node.get('email')
             email = email.removeprefix('mailto:').strip() if isinstance(email, str) else ''
-            if not re.fullmatch(r'[A-Za-z0-9.!#$%&\x27*+/=?^_\x60{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', email):
+            if not _EMAIL_RE.fullmatch(email):
                 email = None
             contacts.setdefault(name.strip().casefold(), VerifiedContact(
                 name=name.strip()[:160], title=title.strip()[:160], company=company,
@@ -200,6 +242,113 @@ class PublicArtifactContactAdapter(ProfessionalContactAdapter):
                 artifact_hook={'type': 'team_bio', 'title': f'{name.strip()[:160]} — {title.strip()[:160]}',
                                'url': source, 'snippet': description},
             ))
+        return list(contacts.values())
+
+    def extract_html_contacts(self, job, raw_html: str, parser=None):
+        """Extract attributed contacts from public HTML team cards or engineering blog author metadata."""
+        company = str(job.get('company') or '').strip()
+        source = str(job.get('source_url') or '').strip()
+        if not company or not source or not raw_html:
+            return []
+        plain_all = re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', unescape(raw_html))).strip()
+        if company.casefold() not in plain_all.casefold():
+            return []
+
+        contacts = {}
+        card_pattern = re.compile(
+            r'<(?:article|section|li|div)\b[^>]*>(.*?)</(?:article|section|li|div)>',
+            re.IGNORECASE | re.DOTALL,
+        )
+        name_role_pattern = re.compile(
+            r'([A-Z][a-zA-Z.\'-]+(?:\s+[A-Z][a-zA-Z.\'-]+){1,2})\s*(?:[—–·|,-]|\n)\s*'
+            r'([A-Za-z0-9 &/,\'-]{3,80})',
+        )
+        for match in card_pattern.finditer(raw_html):
+            if len(contacts) >= 3:
+                break
+            block_html = match.group(1)
+            block_text = re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' | ', unescape(block_html))).strip(' |')
+            if len(block_text) < 35 or len(block_text) > 900:
+                continue
+            if not _ROLE_KEYWORDS_RE.search(block_text):
+                continue
+            segments = [seg.strip() for seg in block_text.split('|') if seg.strip()]
+            person_name = ''
+            person_role = ''
+            snippet_parts = []
+            for idx, seg in enumerate(segments):
+                inline = name_role_pattern.fullmatch(seg)
+                if inline and _ROLE_KEYWORDS_RE.search(inline.group(2)) and not person_name:
+                    person_name = inline.group(1).strip()
+                    person_role = inline.group(2).strip()
+                    continue
+                if (
+                    not person_name
+                    and re.fullmatch(r'[A-Z][a-zA-Z.\'-]+(?:\s+[A-Z][a-zA-Z.\'-]+){1,2}', seg)
+                    and idx + 1 < len(segments)
+                    and _ROLE_KEYWORDS_RE.search(segments[idx + 1])
+                    and len(segments[idx + 1]) <= 90
+                ):
+                    person_name = seg
+                    person_role = segments[idx + 1]
+                    continue
+                if seg not in (person_name, person_role) and len(seg) >= 20:
+                    snippet_parts.append(seg)
+            if not person_name or not person_role or not snippet_parts:
+                continue
+            snippet = ' '.join(snippet_parts)[:300]
+            mailto_match = re.search(
+                r'mailto:([A-Za-z0-9.!#$%&\x27*+/=?^_\x60{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})',
+                block_html,
+            )
+            email = mailto_match.group(1) if mailto_match else None
+            contacts.setdefault(person_name.casefold(), VerifiedContact(
+                name=person_name[:160],
+                title=person_role[:160],
+                company=company,
+                source_url=source,
+                verification_status='verified_public',
+                professional_email=email,
+                relevance_reason=f'The public employer page lists {person_name[:160]} as {person_role[:160]}.',
+                artifact_hook={
+                    'type': 'team_bio',
+                    'title': f'{person_name[:160]} — {person_role[:160]}',
+                    'url': source,
+                    'snippet': snippet,
+                },
+            ))
+
+        if not contacts:
+            author_match = re.search(
+                r'<meta\b[^>]+(?:name|property)=["\'](?:author|article:author)["\'][^>]+content=["\']([^"\']+)["\']',
+                raw_html,
+                re.IGNORECASE,
+            )
+            if author_match:
+                author_name = unescape(author_match.group(1)).strip()
+                role_match = _ROLE_KEYWORDS_RE.search(plain_all)
+                page_title = (getattr(parser, 'metatitle', '') or getattr(parser, 'title', '') or 'Employer Article').strip()
+                page_desc = (getattr(parser, 'description', '') or plain_all[:260]).strip()
+                if (
+                    re.fullmatch(r'[A-Z][a-zA-Z.\'-]+(?:\s+[A-Z][a-zA-Z.\'-]+){1,2}', author_name)
+                    and len(page_desc) >= 20
+                ):
+                    role_label = role_match.group(0) if role_match else 'Team Author'
+                    contacts[author_name.casefold()] = VerifiedContact(
+                        name=author_name[:160],
+                        title=role_label[:160],
+                        company=company,
+                        source_url=source,
+                        verification_status='verified_public',
+                        professional_email=None,
+                        relevance_reason=f'Published author of "{page_title[:120]}" on {company} public page.',
+                        artifact_hook={
+                            'type': 'blog_post',
+                            'title': page_title[:160],
+                            'url': source,
+                            'snippet': page_desc[:300],
+                        },
+                    )
         return list(contacts.values())
 DRAFT_SCHEMA = {
     'type': 'object',
@@ -280,19 +429,33 @@ def classify_reply(sender, subject, body, *, automated=False):
         return 'automated_receipt'
     if re.search(r'\b(unsubscribe me|remove me from|do not contact me|stop emailing me)\b', text):
         return 'unsubscribe'
-    if any(marker in text for marker in ('not moving forward', 'not be moving forward', 'other candidates')):
+    if any(marker in text for marker in ('not moving forward', 'not be moving forward', 'other candidates', 'unfortunately we')):
         return 'rejection'
-    if any(marker in text for marker in ('automated confirmation', 'application has been received', 'application received')) or any(
+    if any(marker in text for marker in ('automated confirmation', 'application has been received', 'application received', 'auto-reply', 'automatic reply')) or any(
         marker in sender for marker in ('no-reply', 'noreply', 'do-not-reply')
     ):
         return 'automated_receipt'
-    if 'interview' in text and any(marker in text for marker in ('schedule', 'invite', 'availability')):
+    if 'interview' in text and any(marker in text for marker in ('schedule', 'invite', 'invitation', 'availability', 'calendar', 'book a time')):
         return 'interview_invitation'
-    if re.search(r"\b(i can refer you|i'd be happy to refer you|i can put you in touch)\b", text):
+    if re.search(r"\b(i can refer you|i'd be happy to refer you|happy to refer you|i can put you in touch|submit a referral)\b", text):
         return 'referral_opportunity'
-    if re.search(r'\b(please send|could you share) (your|a copy of your) (resume|cv|portfolio)\b', text):
+    if re.search(r'\b(please send|could you share|send over) (your|a copy of your) (resume|cv|portfolio|github)\b', text):
         return 'request_for_info'
-    if 'availability' in text and 'conversation' in text:
+    if ('availability' in text and 'conversation' in text) or any(
+        marker in text
+        for marker in (
+            'happy to chat',
+            'love to chat',
+            'open to a quick call',
+            'free for a quick call',
+            'free for a call',
+            "let's connect",
+            'would love to connect',
+            'schedule a quick call',
+            'share your availability',
+            'chat next week',
+        )
+    ):
         return 'human_positive_reply'
     return 'unknown'
 
