@@ -21,6 +21,7 @@ from typing import Any, Callable, Iterable, Mapping, Optional
 import hashlib
 from datetime import datetime, timezone
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from xml.sax.saxutils import escape as _xml_escape
 
 from . import engine
 from .adapters import (
@@ -31,6 +32,7 @@ from .adapters import (
     JobPreflight,
     ModelAdapter,
     ResumeFileAdapter,
+    TailoredResumeResult,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1802,5 +1804,451 @@ class CoPilotApplicationAdapter(ApplicationAdapter):
             answers_sha256=answers_sha256,
             evidence_path=evidence_path,
         )
+
+
+# ---------------------------------------------------------------------------
+# Task A-04: D2 Voice-Preserving Anti-Slop Tailor + Clean OOXML DOCX Preview
+# ---------------------------------------------------------------------------
+
+_XML_CTRL_CHARS_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
+_OOXML_CONTENT_TYPES_XML = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+    '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">\n'
+    '  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>\n'
+    '  <Default Extension="xml" ContentType="application/xml"/>\n'
+    '  <Override PartName="/word/document.xml" '
+    'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>\n'
+    '</Types>\n'
+)
+_OOXML_RELS_XML = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">\n'
+    '  <Relationship Id="rId1" '
+    'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+    'Target="word/document.xml"/>\n'
+    '</Relationships>\n'
+)
+_OOXML_DOCUMENT_RELS_XML = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>\n'
+)
+
+_TAILOR_OUTPUT_SCHEMA: dict[str, Any] = {
+    'type': 'object',
+    'additionalProperties': False,
+    'required': [
+        'tailored_text',
+        'changes',
+        'claim_evidence_map',
+        'unverified_claims',
+        'questions_for_candidate',
+        'why_this_role',
+    ],
+    'properties': {
+        'tailored_text': {'type': 'string', 'minLength': 40},
+        'changes': {
+            'type': 'array',
+            'items': {
+                'type': 'object',
+                'additionalProperties': False,
+                'required': ['original', 'edited', 'reason'],
+                'properties': {
+                    'original': {'type': 'string'},
+                    'edited': {'type': 'string'},
+                    'reason': {'type': 'string'},
+                },
+            },
+        },
+        'claim_evidence_map': {
+            'type': 'array',
+            'items': {
+                'type': 'object',
+                'additionalProperties': False,
+                'required': ['claim', 'source_snippet'],
+                'properties': {
+                    'claim': {'type': 'string'},
+                    'source_snippet': {'type': 'string'},
+                },
+            },
+        },
+        'unverified_claims': {
+            'type': 'array',
+            'items': {'type': 'string'},
+        },
+        'questions_for_candidate': {
+            'type': 'array',
+            'items': {'type': 'string'},
+        },
+        'why_this_role': {'type': 'string'},
+    },
+}
+
+
+class TailorError(ValueError):
+    """Raised on invalid tailoring inputs or modes."""
+
+
+def build_minimal_docx_bytes(resume_text: str) -> bytes:
+    """Build a clean single-column OOXML .docx resume binary using Python stdlib only."""
+    cleaned = _XML_CTRL_CHARS_RE.sub('', str(resume_text or '')).replace('\r\n', '\n').replace('\r', '\n')
+    if not cleaned.strip():
+        raise TailorError('Cannot export empty resume text to DOCX.')
+
+    paragraphs: list[str] = []
+    for raw_line in cleaned.split('\n'):
+        # Replace tabs with single spaces so exported single-column resumes remain ATS-clean.
+        line = raw_line.replace('\t', ' ').strip()
+        if not line:
+            paragraphs.append('<w:p/>')
+        else:
+            escaped = _xml_escape(line)
+            paragraphs.append(f'<w:p><w:r><w:t xml:space="preserve">{escaped}</w:t></w:r></w:p>')
+
+    document_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">\n'
+        '  <w:body>\n'
+        + '\n'.join(f'    {p}' for p in paragraphs)
+        + '\n    <w:sectPr/>\n'
+        '  </w:body>\n'
+        '</w:document>\n'
+    )
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr('[Content_Types].xml', _OOXML_CONTENT_TYPES_XML)
+        zf.writestr('_rels/.rels', _OOXML_RELS_XML)
+        zf.writestr('word/_rels/document.xml.rels', _OOXML_DOCUMENT_RELS_XML)
+        zf.writestr('word/document.xml', document_xml.encode('utf-8'))
+    return buf.getvalue()
+
+
+def _dedupe_strs(values: Iterable[Any], limit: int = 30) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for val in values or ():
+        text = str(val or '').strip()
+        key = text.lower()
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _normalize_changes(raw_changes: Any) -> list[dict[str, str]]:
+    if not isinstance(raw_changes, list):
+        return []
+    out: list[dict[str, str]] = []
+    for item in raw_changes:
+        if not isinstance(item, Mapping):
+            continue
+        orig = str(item.get('original') or '').strip()
+        edited = str(item.get('edited') or '').strip()
+        reason = str(item.get('reason') or '').strip()
+        if not (orig or edited):
+            continue
+        out.append({'original': orig, 'edited': edited, 'reason': reason})
+        if len(out) >= 25:
+            break
+    return out
+
+
+def compute_job_fit_snapshot(resume_text: str, job: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize engine.match_resume output across job title, requirements, and description."""
+    job_text = '\n'.join(
+        str(job.get(field) or '').strip()
+        for field in ('title', 'requirements', 'description')
+        if str(job.get(field) or '').strip()
+    )
+    raw = engine.match_resume(resume_text, job_text)
+    return {
+        'fit_score': int(raw.get('score', 0)),
+        'score': int(raw.get('score', 0)),
+        'matched': list(raw.get('shared_keywords') or []),
+        'missing': list(raw.get('unmatched_job_keywords') or []),
+        'method': str(raw.get('method') or ''),
+    }
+
+
+def _wrap_untrusted(kind: str, content: str) -> str:
+    safe_content = str(content or '').replace('</UNTRUSTED_DATA>', '&lt;/UNTRUSTED_DATA&gt;')
+    return f'<UNTRUSTED_DATA kind="{kind}">\n{safe_content}\n</UNTRUSTED_DATA>'
+
+
+class VoicePreservingTailorAdapter:
+    """D2 Voice-Preserving Anti-Slop Tailor + Claim Grounding + Workday DOCX Round-Trip."""
+
+    def __init__(
+        self,
+        model_adapter: Optional[UnifiedModelAdapter] = None,
+        resume_adapter: Optional[LocalResumeFileAdapter] = None,
+    ):
+        self.model_adapter = model_adapter
+        self.resume_adapter = resume_adapter
+
+    @classmethod
+    def inspect_capabilities(cls) -> dict[str, Any]:
+        return {
+            'implemented': True,
+            'docx_export': 'stdlib_ooxml_single_column',
+            'slop_linter': 'deterministic',
+            'grounding_verifier': 'deterministic',
+            'model_capabilities': UnifiedModelAdapter.inspect_capabilities(),
+        }
+
+    @staticmethod
+    def _build_tailor_user_data(
+        resume_text: str,
+        job: Mapping[str, Any],
+        verified_gap_skills: list[str],
+        candidate_confirmations: Optional[Mapping[str, Any]],
+        ats_match: Optional[Mapping[str, Any]],
+    ) -> str:
+        job_block = '\n'.join([
+            f"Title: {job.get('title', '')}",
+            f"Company: {job.get('company', '')}",
+            f"Location: {job.get('location', '')}",
+            f"Requirements: {job.get('requirements', '')}",
+            f"Description: {job.get('description', '')}",
+        ])
+        parts = [
+            'Task: Tailor the candidate resume strictly from candidate evidence for the target role.',
+            'Requirements:',
+            '1. Preserve the candidate natural writing voice and factual metrics; never add fabricated tools, employers, dates, or percentages.',
+            '2. Avoid AI slop clichés (spearheaded, orchestrated, synergized, leverage, cutting-edge, results-driven, passionately, etc.).',
+            '3. Emit JSON with keys: tailored_text, changes ([{original, edited, reason}]), claim_evidence_map ([{claim, source_snippet}]), unverified_claims, questions_for_candidate, why_this_role.',
+            '4. Include verbatim excerpts from candidate_resume inside source_snippet for every tailored claim.',
+            _wrap_untrusted('candidate_resume', resume_text),
+            _wrap_untrusted('job_posting', job_block),
+        ]
+        if verified_gap_skills:
+            parts.append(_wrap_untrusted('verified_gap_artifacts', ', '.join(verified_gap_skills)))
+        if candidate_confirmations:
+            parts.append(_wrap_untrusted('candidate_confirmations', json.dumps(dict(candidate_confirmations), ensure_ascii=False)))
+        if ats_match:
+            compact_match = {
+                'fit_score': ats_match.get('fit_score'),
+                'matched': ats_match.get('matched') or [],
+                'missing': ats_match.get('missing') or [],
+            }
+            parts.append(_wrap_untrusted('deterministic_ats_match', json.dumps(compact_match, ensure_ascii=False)))
+        return '\n\n'.join(parts)
+
+    @staticmethod
+    def _deterministic_tailor(
+        resume_text: str,
+        job: Mapping[str, Any],
+        verified_gap_skills: list[str],
+        ats_match: Optional[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Conservative voice-preserving tailoring when no LLM key is configured or mode=heuristic."""
+        match_data = dict(ats_match) if ats_match else compute_job_fit_snapshot(resume_text, job)
+        matched = [str(k) for k in (match_data.get('matched') or []) if str(k).strip()]
+        missing = [str(k) for k in (match_data.get('missing') or []) if str(k).strip()]
+        matched_lower = {k.lower() for k in matched}
+
+        raw_lines = resume_text.replace('\r\n', '\n').replace('\r', '\n').split('\n')
+        new_lines: list[str] = []
+        changes: list[dict[str, str]] = []
+        claim_map: list[dict[str, str]] = []
+
+        for line in raw_lines:
+            stripped = line.strip()
+            if stripped.lower().startswith('skills:') and matched:
+                prefix, _, rest = stripped.partition(':')
+                tokens = [t.strip() for t in rest.split(',') if t.strip()]
+                prioritized = sorted(
+                    tokens,
+                    key=lambda tok: (0 if tok.lower() in matched_lower else 1),
+                )
+                reordered = f"{prefix}: {', '.join(prioritized)}"
+                if reordered != stripped:
+                    changes.append({
+                        'original': stripped,
+                        'edited': reordered,
+                        'reason': 'Reordered existing verified skills so role-matched keywords lead first.',
+                    })
+                    new_lines.append(reordered)
+                    claim_map.append({'claim': reordered, 'source_snippet': stripped})
+                    continue
+            new_lines.append(line.rstrip())
+            if stripped and any(tok.lower() in stripped.lower() for tok in matched):
+                claim_map.append({'claim': stripped, 'source_snippet': stripped})
+
+        if verified_gap_skills:
+            existing_lower = resume_text.lower()
+            new_verified = [s for s in verified_gap_skills if s.lower() not in existing_lower]
+            if new_verified:
+                addition = f"Verified Proof-of-Skill Projects: {', '.join(new_verified)}"
+                new_lines.append(addition)
+                changes.append({
+                    'original': '(none)',
+                    'edited': addition,
+                    'reason': 'Appended verified gap-bridge artifacts confirmed by candidate.',
+                })
+                for skill in new_verified:
+                    claim_map.append({
+                        'claim': f'Verified Proof-of-Skill Project: {skill}',
+                        'source_snippet': f'Verified Gap Project: {skill}',
+                    })
+
+        tailored_text = '\n'.join(new_lines).strip()
+        if not claim_map:
+            first_content = next((ln.strip() for ln in raw_lines if len(ln.strip()) >= 12), resume_text[:120].strip())
+            if first_content:
+                claim_map.append({'claim': first_content, 'source_snippet': first_content})
+
+        questions = [
+            f'Do you have concrete, verifiable project experience with {kw} that is omitted from your base resume?'
+            for kw in missing[:3]
+        ]
+        company = str(job.get('company') or 'the team').strip()
+        title = str(job.get('title') or 'this role').strip()
+        if matched:
+            why_this_role = (
+                f"Direct hands-on alignment with {', '.join(matched[:4])} shown in candidate's prior work "
+                f"fits {title} at {company}."
+            )
+        else:
+            why_this_role = f"Candidate background aligns with the engineering scope described for {title} at {company}."
+
+        return {
+            'tailored_text': tailored_text,
+            'changes': changes,
+            'claim_evidence_map': claim_map,
+            'unverified_claims': [],
+            'questions_for_candidate': questions,
+            'why_this_role': why_this_role,
+        }
+
+    def tailor(
+        self,
+        resume_text: str,
+        job: Mapping[str, Any],
+        verified_gap_skills: Iterable[str] = (),
+        candidate_confirmations: Optional[Mapping[str, Any]] = None,
+        mode: str = 'auto',
+        ats_match: Optional[Mapping[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """Tailor resume for a target job with claim-evidence grounding, slop lint, and OOXML preview."""
+        base_resume = str(resume_text or '').strip()
+        if len(base_resume) < 50:
+            raise TailorError('Base resume must contain at least 50 characters before tailoring.')
+        chosen_mode = str(mode or 'auto').strip().lower()
+        if chosen_mode not in ('auto', 'llm', 'heuristic'):
+            raise TailorError('mode must be one of: auto, llm, heuristic.')
+
+        verified_list = _dedupe_strs(verified_gap_skills, limit=25)
+        match_snapshot = dict(ats_match) if ats_match is not None else compute_job_fit_snapshot(base_resume, job)
+
+        provider: Optional[str] = None
+        model: Optional[str] = None
+        if chosen_mode == 'heuristic':
+            raw_payload = self._deterministic_tailor(base_resume, job, verified_list, match_snapshot)
+            generation_mode = 'deterministic_heuristic'
+        else:
+            adapter = self.model_adapter or UnifiedModelAdapter()
+            llm_ready = True
+            if chosen_mode == 'auto':
+                try:
+                    adapter.resolve_provider_and_key()
+                except ModelNotConfiguredError:
+                    llm_ready = False
+            if not llm_ready:
+                raw_payload = self._deterministic_tailor(base_resume, job, verified_list, match_snapshot)
+                generation_mode = 'deterministic_no_llm'
+            else:
+                user_data = self._build_tailor_user_data(
+                    base_resume,
+                    job,
+                    verified_list,
+                    candidate_confirmations,
+                    match_snapshot,
+                )
+                llm_out = adapter.generate_from_prompt(
+                    'resume_tailor_prompt',
+                    user_data,
+                    output_schema=_TAILOR_OUTPUT_SCHEMA,
+                    include_system_guardrails=True,
+                )
+                raw_payload = dict(llm_out) if isinstance(llm_out, Mapping) else {}
+                generation_mode = 'llm'
+                provider = adapter.last_metadata.get('provider')
+                model = adapter.last_metadata.get('model')
+
+        tailored_text = str(
+            raw_payload.get('tailored_text')
+            or raw_payload.get('tailored_resume')
+            or ''
+        ).strip()
+        if not tailored_text:
+            raise ModelOutputError('Tailor response did not include tailored_text.')
+
+        raw_claim_map = raw_payload.get('claim_evidence_map')
+        if raw_claim_map is None:
+            raw_claim_map = raw_payload.get('evidence_map')
+        grounding = engine.verify_tailor_grounding(
+            base_resume,
+            tailored_text,
+            raw_claim_map,
+            candidate_confirmations=candidate_confirmations,
+            verified_gap_skills=verified_list,
+        )
+        lint = engine.lint_ai_slop(tailored_text)
+
+        merged_unverified = _dedupe_strs([
+            *(raw_payload.get('unverified_claims') or []),
+            *(grounding.get('unverified_claims') or []),
+        ])
+        merged_questions = _dedupe_strs([
+            *(raw_payload.get('questions_for_candidate') or []),
+            *(grounding.get('questions_for_candidate') or []),
+        ])
+
+        docx_bytes = build_minimal_docx_bytes(tailored_text)
+        file_adapter = self.resume_adapter or LocalResumeFileAdapter()
+        ats_preview_text = file_adapter.extract_plain_preview(docx_bytes, 'tailored_resume.docx')
+        ats_diagnostics = analyze_ats_preview(ats_preview_text)
+
+        why_this_role = str(raw_payload.get('why_this_role') or '').strip()
+        changes = _normalize_changes(raw_payload.get('changes'))
+        result = TailoredResumeResult(
+            tailored_text=tailored_text,
+            claim_evidence_map=grounding['claim_evidence_map'],
+            slop_warnings=lint['slop_warnings'],
+            unverified_claims=merged_unverified,
+            questions_for_candidate=merged_questions,
+            ats_preview_text=ats_preview_text,
+        )
+        return {
+            'result': result,
+            'tailored_text': result.tailored_text,
+            'claim_evidence_map': result.claim_evidence_map,
+            'slop_warnings': result.slop_warnings,
+            'flagged_terms': lint['flagged_terms'],
+            'slop_score': lint['slop_score'],
+            'unverified_claims': result.unverified_claims,
+            'questions_for_candidate': result.questions_for_candidate,
+            'ats_preview_text': result.ats_preview_text,
+            'ats_diagnostics': ats_diagnostics,
+            'changes': changes,
+            'why_this_role': why_this_role,
+            'generation_mode': generation_mode,
+            'provider': provider,
+            'model': model,
+            'resume_sha256': compute_sha256_text(result.tailored_text),
+        }
+
+
+def tailor_resume_for_job(
+    resume_text: str,
+    job: Mapping[str, Any],
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Module-level helper invoking VoicePreservingTailorAdapter().tailor(...)."""
+    return VoicePreservingTailorAdapter().tailor(resume_text, job, **kwargs)
 
 

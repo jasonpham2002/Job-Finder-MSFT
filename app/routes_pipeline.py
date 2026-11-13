@@ -18,13 +18,20 @@ from . import db, engine
 from .adapters_pipeline import (
     SENSITIVE_FIELDS,
     ApplicationError,
-    CoPilotApplicationAdapter,
     DuplicateApplicationError,
     JobDiscoveryError,
     LiveJobDiscoveryAdapter,
     LocalResumeFileAdapter,
+    ModelAdapterError,
+    ModelNotConfiguredError,
+    CoPilotApplicationAdapter,
     ResumeFileError,
+    TailorError,
     UnifiedModelAdapter,
+    VoicePreservingTailorAdapter,
+    analyze_ats_preview,
+    build_minimal_docx_bytes,
+    compute_job_fit_snapshot,
     compute_sha256_text,
     normalize_job_url,
 )
@@ -34,6 +41,7 @@ _JOB_PREFLIGHT_RE = re.compile(r'^/api/pipeline/jobs/(\d+)/preflight$')
 _APP_COPILOT_RE = re.compile(r'^/api/pipeline/applications/(\d+)/copilot$')
 _JOB_COPILOT_RE = re.compile(r'^/api/pipeline/jobs/(\d+)/copilot$')
 _APP_CONFIRM_RE = re.compile(r'^/api/pipeline/applications/(\d+)/confirm$')
+_APP_EXPORT_DOCX_RE = re.compile(r'^/api/pipeline/applications/(\d+)/export-docx$')
 
 
 def handle_get(path: str):
@@ -43,7 +51,7 @@ def handle_get(path: str):
             'owner': 'Owner A',
             'scope': ['discovery', 'preflight_d1', 'resume_pdf_docx', 'tailor_d2', 'gaps_d5', 'copilot_d3'],
             'implemented': True,
-            'tasks_completed': ['A-01', 'A-02', 'A-03'],
+            'tasks_completed': ['A-01', 'A-02', 'A-03', 'A-04'],
             'model_adapter': UnifiedModelAdapter.inspect_capabilities(),
             'resume_adapter': {
                 **LocalResumeFileAdapter.inspect_capabilities(),
@@ -51,7 +59,11 @@ def handle_get(path: str):
             },
             'discovery_adapter': LiveJobDiscoveryAdapter.inspect_capabilities(),
             'application_adapter': CoPilotApplicationAdapter.inspect_capabilities(),
-            'note': 'Tasks A-01..A-03 active (ModelAdapter, ResumeFileAdapter, JobDiscoveryAdapter + D1, CoPilotApplicationAdapter + D3); A-04..A-05 pending.',
+            'tailor_adapter': VoicePreservingTailorAdapter.inspect_capabilities(),
+            'note': (
+                'Tasks A-01..A-04 active (ModelAdapter, ResumeFileAdapter, JobDiscoveryAdapter + D1, '
+                'CoPilotApplicationAdapter + D3, VoicePreservingTailorAdapter + D2); A-05 pending.'
+            ),
         }
     if path.startswith('/api/pipeline/'):
         return 501, {
@@ -430,6 +442,19 @@ def _safe_json_dict(raw: Any) -> dict[str, Any]:
     return {}
 
 
+def _safe_json_list(raw: Any) -> list[Any]:
+    if isinstance(raw, list):
+        return list(raw)
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                return parsed
+        except ValueError:
+            pass
+    return []
+
+
 def _deserialize_application_row(app_row: Any) -> dict[str, Any]:
     out = dict(app_row)
     answers_store = _safe_json_dict(out.get('answers_json'))
@@ -437,6 +462,8 @@ def _deserialize_application_row(app_row: Any) -> dict[str, Any]:
     out['answers_data'] = answers_store
     out['copilot_packet'] = answers_store.get('copilot_packet')
     out['callback_packet'] = callback_store
+    out['claim_evidence_map'] = _safe_json_list(out.get('claim_map_json'))
+    out['slop_warnings'] = _safe_json_list(out.get('slop_warnings_json'))
     return out
 
 
@@ -737,6 +764,13 @@ def handle_post(path: str, payload: dict):
     preflight_match = _JOB_PREFLIGHT_RE.match(path)
     if preflight_match:
         return _handle_job_preflight(int(preflight_match.group(1)))
+    if path == '/api/pipeline/prepare-ai':
+        return _handle_prepare_ai(payload)
+    if path == '/api/pipeline/tailor/lint':
+        return _handle_tailor_lint(payload)
+    export_docx_match = _APP_EXPORT_DOCX_RE.match(path)
+    if export_docx_match:
+        return _handle_export_docx(int(export_docx_match.group(1)), payload)
     app_copilot_match = _APP_COPILOT_RE.match(path)
     if app_copilot_match:
         return _handle_application_copilot(int(app_copilot_match.group(1)), payload)
@@ -753,3 +787,334 @@ def handle_post(path: str, payload: dict):
             'guide': 'plans/OWNER_A_WORKBOOK.md',
         }
     return None
+
+
+def _resolve_tailor_target_application(job_id: int, application_id: Any) -> tuple[Optional[dict[str, Any]], Optional[tuple[int, dict[str, Any]]]]:
+    if application_id is not None:
+        try:
+            parsed_app_id = int(application_id)
+        except (TypeError, ValueError):
+            return None, (400, {'error': 'application_id must be an integer.'})
+        row = db.row('SELECT * FROM applications WHERE id=?', (parsed_app_id,))
+        if not row:
+            return None, (404, {'error': f'Application {parsed_app_id} not found.'})
+        if int(row['job_id']) != job_id:
+            return None, (400, {'error': 'application_id does not belong to job_id.'})
+        if row['status'] == 'confirmed':
+            return None, (409, {'error': 'Confirmed application is immutable and cannot be re-tailored.'})
+        if row['status'] == 'test_submitted':
+            return None, (409, {'error': 'Demo test_submitted application is isolated; prepare a new draft instead.'})
+        return dict(row), None
+
+    non_demo_rows = db.rows(
+        "SELECT * FROM applications WHERE job_id=? AND status != 'test_submitted' ORDER BY id DESC",
+        (job_id,),
+    )
+    if not non_demo_rows:
+        return None, None
+    latest = dict(non_demo_rows[0])
+    if latest['status'] == 'confirmed':
+        return None, (409, {'error': 'Latest application for this job is confirmed and immutable.'})
+    return latest, None
+
+
+def _handle_prepare_ai(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return 400, {'error': 'Request body must be a JSON object.'}
+    raw_job_id = payload.get('job_id')
+    if raw_job_id is None:
+        return 400, {'error': 'job_id is required.'}
+    try:
+        job_id = int(raw_job_id)
+    except (TypeError, ValueError):
+        return 400, {'error': 'job_id must be an integer.'}
+
+    job_row = db.row('SELECT * FROM jobs WHERE id=?', (job_id,))
+    if not job_row:
+        return 404, {'error': f'Job {job_id} not found.'}
+
+    existing_app, conflict_err = _resolve_tailor_target_application(job_id, payload.get('application_id'))
+    if conflict_err is not None:
+        return conflict_err
+
+    profile_row = db.row('SELECT resume FROM profile WHERE id=1')
+    profile_resume = (profile_row or {}).get('resume') or ''
+    base_resume = str(payload.get('base_resume') or profile_resume).strip()
+    if len(base_resume) < MIN_RESUME_CHARS:
+        return 400, {'error': f'Candidate resume must contain at least {MIN_RESUME_CHARS} characters before tailoring.'}
+
+    gap_rows = db.rows(
+        'SELECT skill_name FROM gap_artifacts WHERE job_id=? AND verified=1 ORDER BY id ASC',
+        (job_id,),
+    )
+    verified_gap_skills = [str(r['skill_name']).strip() for r in gap_rows if str(r['skill_name'] or '').strip()]
+    candidate_confirmations = _safe_json_dict(payload.get('candidate_confirmations'))
+    mode = str(payload.get('mode') or 'auto').strip().lower()
+
+    ats_before = compute_job_fit_snapshot(base_resume, dict(job_row))
+    try:
+        tailored = VoicePreservingTailorAdapter().tailor(
+            base_resume,
+            dict(job_row),
+            verified_gap_skills=verified_gap_skills,
+            candidate_confirmations=candidate_confirmations or None,
+            mode=mode,
+            ats_match=ats_before,
+        )
+    except (TailorError, ModelNotConfiguredError) as exc:
+        return 400, {'error': str(exc)}
+    except ModelAdapterError as exc:
+        return 502, {'error': str(exc)}
+
+    tailored_text = tailored['tailored_text']
+    ats_after = compute_job_fit_snapshot(tailored_text, dict(job_row))
+    claim_map_json = json.dumps(tailored['claim_evidence_map'], ensure_ascii=False)
+    slop_json = json.dumps(tailored['slop_warnings'], ensure_ascii=False)
+
+    existing_cb = _safe_json_dict((existing_app or {}).get('callback_packet_json'))
+    updated_cb = {
+        **existing_cb,
+        'why_this_role': tailored['why_this_role'] or existing_cb.get('why_this_role', ''),
+        'tailor_changes': tailored['changes'][:12],
+        'tailor_summary': {
+            'generation_mode': tailored['generation_mode'],
+            'provider': tailored['provider'],
+            'model': tailored['model'],
+            'fit_score_before': ats_before['fit_score'],
+            'fit_score_after': ats_after['fit_score'],
+            'matched_keywords': ats_after['matched'],
+            'missing_keywords': ats_after['missing'],
+            'changes_count': len(tailored['changes']),
+            'slop_score': tailored['slop_score'],
+            'unverified_count': len(tailored['unverified_claims']),
+            'verified_gap_skills': verified_gap_skills,
+        },
+    }
+    cb_json = json.dumps(updated_cb, ensure_ascii=False)
+
+    with db.connection() as con:
+        if existing_app:
+            app_id = int(existing_app['id'])
+            con.execute(
+                '''UPDATE applications
+                   SET tailored_resume=?, fit_score=?, claim_map_json=?, slop_warnings_json=?,
+                       ats_preview_text=?, callback_packet_json=?, resume_sha256=?
+                   WHERE id=?''',
+                (
+                    tailored_text,
+                    ats_after['fit_score'],
+                    claim_map_json,
+                    slop_json,
+                    tailored['ats_preview_text'],
+                    cb_json,
+                    tailored['resume_sha256'],
+                    app_id,
+                ),
+            )
+        else:
+            app_id = con.execute(
+                '''INSERT INTO applications(
+                       job_id, tailored_resume, fit_score, status, confirmation,
+                       claim_map_json, slop_warnings_json, ats_preview_text, callback_packet_json, resume_sha256
+                   ) VALUES(?,?,?,'draft','',?,?,?,?,?)''',
+                (
+                    job_id,
+                    tailored_text,
+                    ats_after['fit_score'],
+                    claim_map_json,
+                    slop_json,
+                    tailored['ats_preview_text'],
+                    cb_json,
+                    tailored['resume_sha256'],
+                ),
+            ).lastrowid
+
+    refreshed = db.row(
+        'SELECT a.*, j.title, j.company, j.url FROM applications a JOIN jobs j ON j.id=a.job_id WHERE a.id=?',
+        (app_id,),
+    )
+    db.log_audit(
+        'candidate',
+        'resume_tailored',
+        'application',
+        str(app_id),
+        {
+            'job_id': job_id,
+            'generation_mode': tailored['generation_mode'],
+            'provider': tailored['provider'],
+            'model': tailored['model'],
+            'fit_score_before': ats_before['fit_score'],
+            'fit_score_after': ats_after['fit_score'],
+            'claim_count': len(tailored['claim_evidence_map']),
+            'slop_warning_count': len(tailored['slop_warnings']),
+            'unverified_count': len(tailored['unverified_claims']),
+            'resume_sha256': tailored['resume_sha256'],
+        },
+    )
+    return 200, {
+        'ok': True,
+        'application': _deserialize_application_row(refreshed),
+        'tailored_text': tailored_text,
+        'claim_evidence_map': tailored['claim_evidence_map'],
+        'slop_warnings': tailored['slop_warnings'],
+        'flagged_terms': tailored['flagged_terms'],
+        'slop_score': tailored['slop_score'],
+        'unverified_claims': tailored['unverified_claims'],
+        'questions_for_candidate': tailored['questions_for_candidate'],
+        'ats_preview_text': tailored['ats_preview_text'],
+        'ats_diagnostics': tailored['ats_diagnostics'],
+        'changes': tailored['changes'],
+        'why_this_role': tailored['why_this_role'],
+        'generation_mode': tailored['generation_mode'],
+        'provider': tailored['provider'],
+        'model': tailored['model'],
+        'resume_sha256': tailored['resume_sha256'],
+        'fit_before': ats_before,
+        'fit_after': ats_after,
+        'verified_gap_skills': verified_gap_skills,
+    }
+
+
+def _handle_tailor_lint(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return 400, {'error': 'Request body must be a JSON object.'}
+    text = str(payload.get('text') or payload.get('tailored_text') or '').strip()
+    if not text:
+        return 400, {'error': 'text is required.'}
+
+    try:
+        docx_bytes = build_minimal_docx_bytes(text)
+        ats_preview_text = LocalResumeFileAdapter().extract_plain_preview(docx_bytes, 'draft_resume.docx')
+    except (TailorError, ResumeFileError) as exc:
+        return 400, {'error': str(exc)}
+
+    lint = engine.lint_ai_slop(text)
+    ats_diagnostics = analyze_ats_preview(ats_preview_text)
+    resume_sha256 = compute_sha256_text(text)
+
+    fit_match = None
+    job_id = payload.get('job_id')
+    if job_id is not None:
+        try:
+            parsed_job_id = int(job_id)
+        except (TypeError, ValueError):
+            return 400, {'error': 'job_id must be an integer.'}
+        job_row = db.row('SELECT * FROM jobs WHERE id=?', (parsed_job_id,))
+        if not job_row:
+            return 404, {'error': f'Job {parsed_job_id} not found.'}
+        fit_match = compute_job_fit_snapshot(text, dict(job_row))
+
+    grounding = None
+    profile_row = db.row('SELECT resume FROM profile WHERE id=1')
+    base_resume = str(payload.get('base_resume') or ((profile_row or {}).get('resume')) or '').strip()
+    if base_resume:
+        raw_claims = payload.get('claim_evidence_map')
+        if raw_claims is not None:
+            grounding = engine.verify_tailor_grounding(base_resume, text, raw_claims)
+
+    saved_app = None
+    raw_app_id = payload.get('application_id')
+    if raw_app_id is not None and bool(payload.get('save', False)):
+        try:
+            app_id = int(raw_app_id)
+        except (TypeError, ValueError):
+            return 400, {'error': 'application_id must be an integer.'}
+        app_row = db.row('SELECT * FROM applications WHERE id=?', (app_id,))
+        if not app_row:
+            return 404, {'error': f'Application {app_id} not found.'}
+        if app_row['status'] == 'confirmed':
+            return 409, {'error': 'Confirmed application is immutable and cannot be modified.'}
+        if app_row['status'] == 'test_submitted':
+            return 409, {'error': 'Demo test_submitted application is isolated and cannot be modified.'}
+        new_fit = fit_match['fit_score'] if fit_match else app_row['fit_score']
+        with db.connection() as con:
+            con.execute(
+                '''UPDATE applications
+                   SET tailored_resume=?, fit_score=?, slop_warnings_json=?, ats_preview_text=?, resume_sha256=?
+                   WHERE id=?''',
+                (
+                    text,
+                    new_fit,
+                    json.dumps(lint['slop_warnings'], ensure_ascii=False),
+                    ats_preview_text,
+                    resume_sha256,
+                    app_id,
+                ),
+            )
+        refreshed = db.row(
+            'SELECT a.*, j.title, j.company, j.url FROM applications a JOIN jobs j ON j.id=a.job_id WHERE a.id=?',
+            (app_id,),
+        )
+        saved_app = _deserialize_application_row(refreshed)
+
+    return 200, {
+        'ok': True,
+        'slop_warnings': lint['slop_warnings'],
+        'flagged_terms': lint['flagged_terms'],
+        'slop_score': lint['slop_score'],
+        'clean': lint['clean'],
+        'ats_preview_text': ats_preview_text,
+        'ats_diagnostics': ats_diagnostics,
+        'resume_sha256': resume_sha256,
+        'fit_match': fit_match,
+        'grounding': grounding,
+        'application': saved_app,
+    }
+
+
+def _handle_export_docx(app_id: int, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return 400, {'error': 'Request body must be a JSON object.'}
+    app_row = db.row(
+        'SELECT a.*, j.title, j.company FROM applications a LEFT JOIN jobs j ON j.id=a.job_id WHERE a.id=?',
+        (app_id,),
+    )
+    if not app_row:
+        return 404, {'error': f'Application {app_id} not found.'}
+
+    custom_text = str(payload.get('text') or '').strip()
+    stored_text = str(app_row['tailored_resume'] or '').strip()
+    if custom_text and app_row['status'] == 'confirmed' and custom_text != stored_text:
+        return 409, {'error': 'Confirmed application is immutable; cannot export altered text under this receipt.'}
+
+    resume_text = custom_text or stored_text
+    if not resume_text:
+        return 400, {'error': 'Application has no tailored resume text to export.'}
+
+    try:
+        docx_bytes = build_minimal_docx_bytes(resume_text)
+        ats_preview_text = LocalResumeFileAdapter().extract_plain_preview(docx_bytes, 'export.docx')
+    except (TailorError, ResumeFileError) as exc:
+        return 400, {'error': str(exc)}
+
+    company = str(app_row['company'] or 'company').strip()
+    title = str(app_row['title'] or 'resume').strip()
+    slug = re.sub(r'[^a-z0-9]+', '_', f'{company}_{title}_tailored'.lower()).strip('_') or f'application_{app_id}'
+    filename = f'{slug}.docx'
+    docx_sha256 = hashlib.sha256(docx_bytes).hexdigest()
+    resume_sha256 = compute_sha256_text(resume_text)
+
+    db.log_audit(
+        'candidate',
+        'docx_exported',
+        'application',
+        str(app_id),
+        {
+            'filename': filename,
+            'byte_length': len(docx_bytes),
+            'docx_sha256': docx_sha256,
+            'resume_sha256': resume_sha256,
+        },
+    )
+    return 200, {
+        'ok': True,
+        'application_id': app_id,
+        'filename': filename,
+        'mime_type': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'content_base64': base64.b64encode(docx_bytes).decode('ascii'),
+        'byte_length': len(docx_bytes),
+        'docx_sha256': docx_sha256,
+        'resume_sha256': resume_sha256,
+        'ats_preview_text': ats_preview_text,
+        'ats_diagnostics': analyze_ats_preview(ats_preview_text),
+    }

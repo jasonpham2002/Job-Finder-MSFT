@@ -201,6 +201,26 @@
 
       <div id="pipelineReceiptLedger" style="margin-top:10px;"></div>
     </div>
+    <div style="border-top:1px solid #d9e1ea;padding-top:10px;margin-top:12px;">
+      <div style="display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:8px;">
+        <div>
+          <strong>D2 Voice-Preserving Anti-Slop Tailor &amp; Workday Preview (A-04)</strong>
+          <span id="pipelineTailorBadge"></span>
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;">
+          <select id="pipelineTailorMode" aria-label="Tailor mode" style="width:auto;min-width:170px;">
+            <option value="auto">Mode: Auto (LLM if configured)</option>
+            <option value="llm">Mode: LLM Only</option>
+            <option value="heuristic">Mode: Deterministic Offline</option>
+          </select>
+          <button id="pipelineAiTailorBtn" type="button">Run AI Anti-Slop Tailor (Selected Job)</button>
+          <button id="pipelineRelintBtn" type="button" class="secondary">Re-Lint Draft &amp; Workday Preview</button>
+          <button id="pipelineExportDocxBtn" type="button" class="secondary">Download ATS-Clean .docx</button>
+        </div>
+      </div>
+      <div id="pipelineTailorStatus" class="muted" style="margin-top:6px;">Select a job, then run Anti-Slop Tailor to verify every claim against your resume and preview clean OOXML text.</div>
+      <div id="pipelineTailorWorkspace" style="margin-top:10px;"></div>
+    </div>
   `;
 
   const statusPill = document.getElementById('pipelineStatusPill');
@@ -252,9 +272,194 @@
   const approvalScopeText = document.getElementById('pipelineApprovalScopeText');
   const confirmSubmitBtn = document.getElementById('pipelineConfirmSubmitBtn');
   const receiptLedgerEl = document.getElementById('pipelineReceiptLedger');
+  const tailorModeEl = document.getElementById('pipelineTailorMode');
+  const aiTailorBtn = document.getElementById('pipelineAiTailorBtn');
+  const relintBtn = document.getElementById('pipelineRelintBtn');
+  const exportDocxBtn = document.getElementById('pipelineExportDocxBtn');
+  const tailorStatusEl = document.getElementById('pipelineTailorStatus');
+  const tailorWorkspaceEl = document.getElementById('pipelineTailorWorkspace');
 
   let pendingFallbackUrl = '';
   let activeCopilotAppId = null;
+  let activeTailorAppId = null;
+  let lastTailorReport = null;
+
+  function base64ToUint8Array(b64) {
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes;
+  }
+
+  function renderTailorReport(report) {
+    if (!tailorWorkspaceEl) return;
+    if (!report) {
+      tailorWorkspaceEl.innerHTML = '';
+      return;
+    }
+    const claims = Array.isArray(report.claim_evidence_map) ? report.claim_evidence_map : [];
+    const changes = Array.isArray(report.changes) ? report.changes : [];
+    const slopWarnings = Array.isArray(report.slop_warnings) ? report.slop_warnings : [];
+    const flaggedTerms = Array.isArray(report.flagged_terms) ? report.flagged_terms : [];
+    const unverified = Array.isArray(report.unverified_claims) ? report.unverified_claims : [];
+    const questions = Array.isArray(report.questions_for_candidate) ? report.questions_for_candidate : [];
+    const diagWarnings = (report.ats_diagnostics && Array.isArray(report.ats_diagnostics.warnings))
+      ? report.ats_diagnostics.warnings
+      : [];
+    const fitBefore = report.fit_before && typeof report.fit_before.fit_score === 'number'
+      ? report.fit_before.fit_score
+      : null;
+    const fitAfter = report.fit_after && typeof report.fit_after.fit_score === 'number'
+      ? report.fit_after.fit_score
+      : (report.fit_match && typeof report.fit_match.fit_score === 'number' ? report.fit_match.fit_score : null);
+
+    const modeLabel = report.generation_mode
+      ? `${report.generation_mode}${report.provider ? ` (${report.provider}:${report.model || ''})` : ''}`
+      : 'lint_check';
+    const slopTone = slopWarnings.length === 0 ? 'good' : 'warn';
+    const unverifiedTone = unverified.length === 0 ? 'good' : 'danger';
+    const diagTone = diagWarnings.length === 0 ? 'good' : 'warn';
+
+    const fitBadge = fitAfter !== null
+      ? badgeHtml(
+          fitBefore !== null ? `ATS Fit: ${fitBefore}% -> ${fitAfter}%` : `ATS Fit: ${fitAfter}%`,
+          fitAfter >= 65 ? 'good' : 'warn',
+        )
+      : '';
+
+    const badges = [
+      badgeHtml(`Mode: ${modeLabel}`, report.generation_mode === 'llm' ? 'good' : 'neutral'),
+      fitBadge,
+      badgeHtml(`Grounded Claims: ${claims.length}`, claims.length > 0 ? 'good' : 'warn'),
+      badgeHtml(`Unverified: ${unverified.length}`, unverifiedTone),
+      badgeHtml(`Slop Warnings: ${slopWarnings.length}`, slopTone),
+      badgeHtml(`Workday Layout Warnings: ${diagWarnings.length}`, diagTone),
+    ].join('');
+
+    const changesHtml = changes.length
+      ? changes.map((c) => (
+          `<div style="border-bottom:1px solid #eef2f7;padding:5px 0;">
+            <div><strong>Orig:</strong> <span class="muted">${esc(c.original || '(new)')}</span></div>
+            <div><strong>Edit:</strong> ${esc(c.edited || '')}</div>
+            ${c.reason ? `<div class="muted" style="font-size:11px;">Reason: ${esc(c.reason)}</div>` : ''}
+          </div>`
+        )).join('')
+      : '<div class="muted">No structural edits logged in this snapshot.</div>';
+
+    const claimsHtml = claims.length
+      ? `<table style="width:100%;border-collapse:collapse;font-size:12px;">
+          <thead>
+            <tr style="text-align:left;border-bottom:1px solid #d9e1ea;">
+              <th style="padding:4px;">Tailored Claim</th>
+              <th style="padding:4px;">Source Resume Evidence</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${claims.map((item) => (
+              `<tr style="border-bottom:1px solid #eef2f7;">
+                <td style="padding:4px;vertical-align:top;">${esc(item.claim || '')}</td>
+                <td style="padding:4px;vertical-align:top;color:#116337;">${esc(item.source_snippet || '')}</td>
+              </tr>`
+            )).join('')}
+          </tbody>
+        </table>`
+      : '<div class="muted">No claim trace entries available for this draft.</div>';
+
+    const unverifiedHtml = (unverified.length || questions.length)
+      ? `<div style="border:1px solid ${unverified.length ? '#f5aaaa' : '#f0cc7a'};background:${unverified.length ? '#fdecec' : '#fff6e0'};border-radius:6px;padding:8px;margin-top:8px;">
+          ${unverified.length ? `<div><strong>Unverified Claims Flagged (${unverified.length}):</strong><ul style="margin:4px 0 6px 18px;">${unverified.map((u) => `<li>${esc(u)}</li>`).join('')}</ul></div>` : ''}
+          ${questions.length ? `<div><strong>Questions for Candidate Before Accepting:</strong><ul style="margin:4px 0 0 18px;">${questions.map((q) => `<li>${esc(q)}</li>`).join('')}</ul></div>` : ''}
+        </div>`
+      : '';
+
+    const slopHtml = slopWarnings.length
+      ? `<ul style="margin:4px 0 0 18px;color:#8a5200;">
+          ${slopWarnings.map((w) => `<li>${esc(w)}</li>`).join('')}
+         </ul>
+         ${flaggedTerms.length ? `<div class="muted" style="font-size:11px;margin-top:4px;">Flagged terms: ${esc(flaggedTerms.map((ft) => (typeof ft === 'string' ? ft : `${ft.term} (${ft.suggestion || 'rewrite plainly'})`)).join('; '))}</div>` : ''}`
+      : '<div style="color:#116337;">Clean — zero AI slop buzzwords or canned hype patterns detected.</div>';
+
+    const workdayWarningsHtml = diagWarnings.length
+      ? `<ul style="margin:4px 0 6px 18px;color:#8a5200;">${diagWarnings.map((w) => `<li>${esc(w)}</li>`).join('')}</ul>`
+      : '<div style="color:#116337;margin-bottom:4px;">Single-column OOXML linearized cleanly with zero Workday layout warnings.</div>';
+
+    tailorWorkspaceEl.innerHTML = `
+      <div style="margin-bottom:8px;">${badges}</div>
+      ${report.why_this_role ? `<div style="background:#f8fafc;border:1px solid #d9e1ea;border-radius:6px;padding:8px;margin-bottom:8px;"><strong>Why This Role (Callback Hook):</strong> ${esc(report.why_this_role)}</div>` : ''}
+      ${unverifiedHtml}
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:10px;margin-top:8px;">
+        <div style="border:1px solid #d9e1ea;border-radius:6px;padding:8px;background:#fff;">
+          <strong>Claim Trace (Claim &rarr; Source Snippet)</strong>
+          <div style="max-height:200px;overflow:auto;margin-top:4px;">${claimsHtml}</div>
+        </div>
+        <div style="border:1px solid #d9e1ea;border-radius:6px;padding:8px;background:#fff;">
+          <strong>Change Diff &amp; Voice Audit</strong>
+          <div style="max-height:150px;overflow:auto;margin-top:4px;">${changesHtml}</div>
+          <div style="border-top:1px solid #eef2f7;margin-top:6px;padding-top:6px;">
+            <strong>Anti-Slop Lint (Score: ${esc(report.slop_score ?? 0)})</strong>
+            ${slopHtml}
+          </div>
+        </div>
+      </div>
+      <div style="border:1px solid #d9e1ea;border-radius:6px;padding:8px;background:#f8fafc;margin-top:8px;">
+        <strong>See What Workday Sees (Plain-Text .docx Round-Trip)</strong>
+        ${workdayWarningsHtml}
+        <pre style="margin:0;white-space:pre-wrap;font-size:11px;max-height:160px;overflow:auto;background:#fff;padding:6px;border:1px solid #e2e8f0;border-radius:4px;">${esc(report.ats_preview_text || '')}</pre>
+        ${report.resume_sha256 ? `<div class="muted" style="font-size:11px;margin-top:4px;">SHA-256: <code>${esc(report.resume_sha256)}</code></div>` : ''}
+      </div>
+    `;
+  }
+
+  async function syncTailorWorkspaceForSelectedJob() {
+    if (!tailorWorkspaceEl) return;
+    if (typeof chosen === 'undefined' || !chosen || !chosen.id) {
+      activeTailorAppId = null;
+      return;
+    }
+    try {
+      const resp = await fetch('/api/state');
+      const stateData = await resp.json();
+      const apps = Array.isArray(stateData.applications) ? stateData.applications : [];
+      const matching = apps.filter((a) => Number(a.job_id) === Number(chosen.id) && a.status !== 'test_submitted');
+      const latest = matching[0] || null;
+      if (!latest) {
+        activeTailorAppId = null;
+        renderTailorReport(null);
+        return;
+      }
+      activeTailorAppId = latest.id;
+      const claims = safeParseJson(latest.claim_map_json) || [];
+      const slopWarnings = safeParseJson(latest.slop_warnings_json) || [];
+      const cb = safeParseJson(latest.callback_packet_json) || {};
+      const tailorSummary = cb.tailor_summary || {};
+      if (claims.length || latest.ats_preview_text || slopWarnings.length) {
+        lastTailorReport = {
+          claim_evidence_map: claims,
+          slop_warnings: slopWarnings,
+          flagged_terms: [],
+          slop_score: tailorSummary.slop_score ?? slopWarnings.length * 25,
+          unverified_claims: [],
+          questions_for_candidate: [],
+          ats_preview_text: latest.ats_preview_text || '',
+          ats_diagnostics: { warnings: [] },
+          changes: cb.tailor_changes || [],
+          why_this_role: cb.why_this_role || '',
+          generation_mode: tailorSummary.generation_mode || '',
+          provider: tailorSummary.provider || '',
+          model: tailorSummary.model || '',
+          resume_sha256: latest.resume_sha256 || '',
+          fit_after: { fit_score: latest.fit_score },
+        };
+        renderTailorReport(lastTailorReport);
+      } else {
+        renderTailorReport(null);
+      }
+    } catch (_err) {
+      // Non-blocking UI sync
+    }
+  }
 
   async function refreshPipelineStatus() {
     try {
@@ -728,14 +933,152 @@
     }
   });
 
+  if (aiTailorBtn) {
+    aiTailorBtn.addEventListener('click', async () => {
+      if (typeof chosen === 'undefined' || !chosen || !chosen.id) {
+        showNotice('Select a job from the list before running Anti-Slop Tailor.');
+        return;
+      }
+      const mode = tailorModeEl ? tailorModeEl.value : 'auto';
+      if (tailorStatusEl) {
+        tailorStatusEl.textContent = `Running D2 Anti-Slop Tailor (${mode}) for ${chosen.company} — ${chosen.title}...`;
+      }
+      aiTailorBtn.disabled = true;
+      try {
+        const data = await postJson('/api/pipeline/prepare-ai', {
+          job_id: chosen.id,
+          mode,
+        });
+        activeTailorAppId = data.application ? data.application.id : null;
+        if (activeTailorAppId) {
+          activeCopilotAppId = activeTailorAppId;
+        }
+        lastTailorReport = data;
+        const tailoredBox = document.getElementById('tailored');
+        if (tailoredBox) tailoredBox.value = data.tailored_text || '';
+        const fitBox = document.getElementById('fit');
+        if (fitBox && data.fit_after) {
+          fitBox.innerHTML = `<span class="badge">Fit ${esc(data.fit_after.fit_score)}%</span>`
+            + `<span class="muted"> Matched: ${esc((data.fit_after.matched || []).join(', ') || 'none')} | Missing: ${esc((data.fit_after.missing || []).join(', ') || 'none')}</span>`;
+        }
+        if (tailorStatusEl) {
+          tailorStatusEl.textContent = `Tailored via ${data.generation_mode} (Application #${activeTailorAppId || '?'}; ${data.claim_evidence_map.length} verified claims, ${data.slop_warnings.length} slop warnings).`;
+        }
+        renderTailorReport(data);
+        showNotice('AI Anti-Slop Tailor completed with verified claim trace.');
+        if (typeof reload === 'function') await reload();
+        await renderReceiptLedger();
+      } catch (err) {
+        if (tailorStatusEl) tailorStatusEl.textContent = `Error: ${err.message}`;
+        showNotice(`Anti-Slop Tailor failed: ${err.message}`);
+      } finally {
+        aiTailorBtn.disabled = false;
+      }
+    });
+  }
+
+  if (relintBtn) {
+    relintBtn.addEventListener('click', async () => {
+      const tailoredBox = document.getElementById('tailored');
+      const text = tailoredBox ? tailoredBox.value.trim() : '';
+      if (!text) {
+        showNotice('Tailored resume editor is empty; paste or generate a draft first.');
+        return;
+      }
+      relintBtn.disabled = true;
+      try {
+        const data = await postJson('/api/pipeline/tailor/lint', {
+          text,
+          job_id: (typeof chosen !== 'undefined' && chosen && chosen.id) ? chosen.id : undefined,
+          application_id: activeTailorAppId || undefined,
+          save: Boolean(activeTailorAppId),
+          claim_evidence_map: lastTailorReport ? lastTailorReport.claim_evidence_map : undefined,
+        });
+        const merged = {
+          ...(lastTailorReport || {}),
+          slop_warnings: data.slop_warnings,
+          flagged_terms: data.flagged_terms,
+          slop_score: data.slop_score,
+          ats_preview_text: data.ats_preview_text,
+          ats_diagnostics: data.ats_diagnostics,
+          resume_sha256: data.resume_sha256,
+          fit_match: data.fit_match,
+        };
+        if (data.grounding) {
+          merged.claim_evidence_map = data.grounding.claim_evidence_map;
+          merged.unverified_claims = data.grounding.unverified_claims;
+          merged.questions_for_candidate = data.grounding.questions_for_candidate;
+        }
+        lastTailorReport = merged;
+        renderTailorReport(merged);
+        if (tailorStatusEl) {
+          tailorStatusEl.textContent = `Re-linted draft: ${data.slop_warnings.length} slop warnings, Workday preview updated.`;
+        }
+        showNotice('Re-lint & Workday preview refreshed.');
+      } catch (err) {
+        if (tailorStatusEl) tailorStatusEl.textContent = `Re-lint failed: ${err.message}`;
+        showNotice(`Re-lint error: ${err.message}`);
+      } finally {
+        relintBtn.disabled = false;
+      }
+    });
+  }
+
+  if (exportDocxBtn) {
+    exportDocxBtn.addEventListener('click', async () => {
+      const targetAppId = activeTailorAppId || activeCopilotAppId;
+      if (!targetAppId) {
+        showNotice('Run AI Anti-Slop Tailor (or Prepare Co-Pilot Packet) first to create a draft application.');
+        return;
+      }
+      const tailoredBox = document.getElementById('tailored');
+      const currentText = tailoredBox ? tailoredBox.value.trim() : '';
+      exportDocxBtn.disabled = true;
+      try {
+        const data = await postJson(`/api/pipeline/applications/${targetAppId}/export-docx`, {
+          text: currentText || undefined,
+        });
+        const bytes = base64ToUint8Array(data.content_base64);
+        const blob = new Blob([bytes], { type: data.mime_type });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = data.filename || `application_${targetAppId}_tailored.docx`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        if (tailorStatusEl) {
+          tailorStatusEl.textContent = `Downloaded ${data.filename} (${data.byte_length} bytes, SHA-256 ${data.docx_sha256.slice(0, 12)}...).`;
+        }
+        showNotice(`Exported ATS-clean DOCX: ${data.filename}`);
+      } catch (err) {
+        showNotice(`DOCX export failed: ${err.message}`);
+      } finally {
+        exportDocxBtn.disabled = false;
+      }
+    });
+  }
+
   const prepareBtn = document.getElementById('prepare');
   if (prepareBtn) {
     prepareBtn.addEventListener('click', () => {
-      setTimeout(renderReceiptLedger, 500);
+      setTimeout(() => {
+        renderReceiptLedger();
+        syncTailorWorkspaceForSelectedJob();
+      }, 500);
+    });
+  }
+
+  const jobsListEl = document.getElementById('jobs');
+  if (jobsListEl) {
+    jobsListEl.addEventListener('click', () => {
+      setTimeout(syncTailorWorkspaceForSelectedJob, 50);
     });
   }
 
   refreshPipelineStatus();
   renderPreflightBoard();
   renderReceiptLedger();
+  syncTailorWorkspaceForSelectedJob();
 })();

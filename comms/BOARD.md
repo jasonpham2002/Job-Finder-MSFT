@@ -20,7 +20,7 @@
 ## Active File Locks & Blockers
 | File / Scope | Locked By | Task ID | Since | Notes |
 |---|---|---|---|---|
-| _(none)_ | - | - | - | `A-03` completed & verified; Owner A ready to claim `A-04` |
+| _(none)_ | — | — | — | A-04 complete (44/44 tests passing); ready for A-05 claim |
 
 **Current Blockers:** _None — Foundation (`S-01`) complete via `comms/handoffs/H-01-foundation-ready.md`._
 
@@ -39,7 +39,7 @@
 | `A-01` | Unified `ModelAdapter` (OpenAI/Gemini/Anthropic) + `ResumeFileAdapter` (PDF/DOCX) | `DONE` | `S-01` | `app/adapters_pipeline.py`, `app/routes_pipeline.py`, `web/pipeline.js`, `tests/test_pipeline.py` · See `comms/handoffs/H-02-model-resume-adapters.md` |
 | `A-02` | `JobDiscoveryAdapter` (Greenhouse/Lever/Ashby) + **D1** Pre-Flight Shield | `DONE` | `A-01` | `app/engine.py`, `app/adapters_pipeline.py`, `app/routes_pipeline.py`, `web/pipeline.js`, `tests/test_pipeline.py` (36/36 tests passing; Serper smoke test OK) |
 | `A-03` | **D3** Co-Pilot Packet + Sensitive-Field Gate + SHA-256 Receipts | `DONE` | `A-01` | `app/adapters_pipeline.py`, `app/routes_pipeline.py`, `web/pipeline.js`, `tests/test_pipeline.py` (39/39 tests passing) |
-| `A-04` | **D2** Voice-Preserving Anti-Slop Tailor + ATS Plain-Text Preview | `TODO` | `A-01` | `app/engine.py`, `app/adapters_pipeline.py`, `web/pipeline.js` |
+| `A-04` | **D2** Voice-Preserving Anti-Slop Tailor + ATS Plain-Text Preview | `DONE` | `A-01` | `app/engine.py`, `app/adapters_pipeline.py`, `app/routes_pipeline.py`, `web/pipeline.js`, `tests/test_pipeline.py` (44/44 tests passing; live Gemini `gemini-3.8-flash` smoke test OK) |
 | `A-05` | **D5** Gap-to-Proof Bridge + **D2** Callback Cheat Sheet Snapshot | `TODO` | `A-04` | `app/routes_pipeline.py`, `web/pipeline.js` |
 | `A-06` | *(Optional)* Headed Playwright HITL Autofill | `TODO` | `A-03` | `app/adapters_pipeline.py` |
 | `A-07` | Unit tests (`tests/test_pipeline.py`) + Live Submissions | `TODO` | `A-03` | `tests/test_pipeline.py` |

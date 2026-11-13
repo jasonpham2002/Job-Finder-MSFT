@@ -1205,5 +1205,314 @@ class CoPilotApplicationAndReceiptTests(unittest.TestCase):
         self.assertIn('GH-CONF-501-XYZ', audits[0]['details_json'])
 
 
+from app import engine
+from app.adapters import TailoredResumeResult
+from app.adapters_pipeline import VoicePreservingTailorAdapter, build_minimal_docx_bytes
+
+
+class AntiSlopTailorAndPreviewTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._db_path = Path(self._tmp.name) / 'test_tailor.sqlite3'
+        self._patch = mock.patch.object(db, 'DB_PATH', self._db_path)
+        self._patch.start()
+        db.init_db()
+        self.sample_resume = (
+            'Jordan Taylor\n'
+            'Seattle, WA | jordan.taylor@example.org\n'
+            'Skills: Python, SQL, REST APIs, Docker, Automated Testing\n'
+            'Experience:\n'
+            '- Software Engineer, Northwind Systems (2023-2026): Built Python REST APIs and SQL ETL jobs, '
+            'reducing nightly query runtime by 20% across 12 production tables.\n'
+            '- Engineering Intern, Fabrikam Cloud (2022-2023): Wrote integration tests in pytest and Containerized '
+            'CI checks with Docker.\n'
+        )
+        self.sample_job = {
+            'id': 1,
+            'title': 'Backend Software Engineer',
+            'company': 'Contoso Cloud',
+            'location': 'Seattle, WA',
+            'description': 'Build reliable Python microservices, SQL schemas, and Docker test harnesses.',
+            'requirements': 'Python, SQL, Docker, Kubernetes, REST APIs',
+            'url': 'https://boards.greenhouse.io/contoso/jobs/9001',
+        }
+
+    def tearDown(self):
+        self._patch.stop()
+        self._tmp.cleanup()
+
+    def test_lint_ai_slop_flags_buzzwords_and_allows_authentic_prose(self):
+        clean_report = engine.lint_ai_slop(self.sample_resume)
+        self.assertTrue(clean_report['clean'])
+        self.assertEqual(clean_report['slop_warnings'], [])
+        self.assertEqual(clean_report['slop_score'], 0)
+
+        sloppy = (
+            'Results-driven, passionate engineer who spearheaded and orchestrated synergy to '
+            'leverage cutting-edge paradigms seamlessly!'
+        )
+        dirty_report = engine.lint_ai_slop(sloppy)
+        self.assertFalse(dirty_report['clean'])
+        self.assertGreater(dirty_report['slop_score'], 0)
+        self.assertGreaterEqual(len(dirty_report['slop_warnings']), 3)
+        flagged_names = {item['term'] for item in dirty_report['flagged_terms']}
+        self.assertIn('spearheaded', flagged_names)
+        self.assertIn('leveraged', flagged_names)
+
+    def test_verify_tailor_grounding_flags_fabrications_and_allows_verified_gaps(self):
+        fabricated_resume = (
+            'Jordan Taylor\n'
+            'Skills: Python, SQL, Kubernetes, Terraform\n'
+            '- Software Engineer, Northwind Systems (2023-2026): Built Python REST APIs, reducing runtime by 95%.\n'
+        )
+        raw_claims = [
+            {'claim': 'Built Python REST APIs at Northwind Systems', 'source_snippet': 'Built Python REST APIs and SQL ETL jobs'},
+            {'claim': 'Production Kubernetes cluster administrator', 'source_snippet': 'Managed 50 Kubernetes clusters'},
+        ]
+        res = engine.verify_tailor_grounding(self.sample_resume, fabricated_resume, raw_claims)
+        # Only verbatim source_snippet claims stay in claim_evidence_map
+        self.assertEqual(len(res['claim_evidence_map']), 1)
+        self.assertEqual(res['claim_evidence_map'][0]['source_snippet'], 'Built Python REST APIs and SQL ETL jobs')
+        # Unverified Kubernetes snippet, new skill tokens, and fabricated 95% metric must be flagged
+        unverified_joined = ' '.join(res['unverified_claims']).lower()
+        self.assertIn('95%', unverified_joined)
+        self.assertIn('kubernetes', unverified_joined)
+        self.assertGreaterEqual(len(res['questions_for_candidate']), 1)
+
+        # Marking Kubernetes & Terraform as verified gap artifacts clears grounded gap claims while still blocking fabricated numbers
+        verified_claims = [
+            {'claim': 'Built Python REST APIs at Northwind Systems', 'source_snippet': 'Built Python REST APIs and SQL ETL jobs'},
+            {'claim': 'Verified Proof-of-Skill Project: Kubernetes', 'source_snippet': 'Verified Gap Project: Kubernetes'},
+        ]
+        res_verified = engine.verify_tailor_grounding(
+            self.sample_resume,
+            fabricated_resume,
+            verified_claims,
+            verified_gap_skills=['Kubernetes', 'Terraform'],
+        )
+        self.assertEqual(len(res_verified['claim_evidence_map']), 2)
+        unverified_after = ' '.join(res_verified['unverified_claims']).lower()
+        self.assertNotIn('kubernetes', unverified_after)
+        self.assertIn('95%', unverified_after)
+
+    def test_build_minimal_docx_bytes_roundtrip_and_xml_escaping(self):
+        tricky_resume = (
+            'Jordan Taylor\n'
+            'Focus: AT&T billing <v2>, C# & Python APIs\n'
+            'Experience (2023-2026):\n'
+            '- Cut API errors by 20% using strict validation & schema checks across production endpoints.\n'
+            '- Built repeatable CI pipelines ensuring single-column ATS readability across Workday forms.\n'
+        )
+        docx_bytes = build_minimal_docx_bytes(tricky_resume)
+        self.assertTrue(zipfile.is_zipfile(io.BytesIO(docx_bytes)))
+        with zipfile.ZipFile(io.BytesIO(docx_bytes), 'r') as zf:
+            names = set(zf.namelist())
+            self.assertIn('[Content_Types].xml', names)
+            self.assertIn('_rels/.rels', names)
+            self.assertIn('word/document.xml', names)
+
+        preview = LocalResumeFileAdapter().extract_plain_preview(docx_bytes, 'tailored_resume.docx')
+        self.assertIn('AT&T billing <v2>, C# & Python APIs', preview)
+        diag = analyze_ats_preview(preview)
+        self.assertEqual(diag['warnings'], [])
+
+    def test_voice_preserving_tailor_adapter_mocked_llm_and_honest_fallbacks(self):
+        captured_prompts: list[dict] = []
+
+        def fake_gemini_transport(url, headers, payload, timeout):
+            captured_prompts.append(payload)
+            return {
+                'steps': [{
+                    'type': 'model_output',
+                    'content': [{
+                        'type': 'text',
+                        'text': json.dumps({
+                            'tailored_text': (
+                                'Jordan Taylor\n'
+                                'Seattle, WA | jordan.taylor@example.org\n'
+                                'Skills: Python, SQL, Docker, REST APIs, Automated Testing\n'
+                                'Experience:\n'
+                                '- Software Engineer, Northwind Systems (2023-2026): Built Python REST APIs and '
+                                'SQL ETL jobs, reducing nightly query runtime by 20% across 12 production tables.\n'
+                            ),
+                            'changes': [{
+                                'original': 'Skills: Python, SQL, REST APIs, Docker, Automated Testing',
+                                'edited': 'Skills: Python, SQL, Docker, REST APIs, Automated Testing',
+                                'reason': 'Moved Docker forward to mirror role priorities using verified resume skills.',
+                            }],
+                            'claim_evidence_map': [{
+                                'claim': 'Built Python REST APIs and SQL ETL jobs reducing runtime by 20%',
+                                'source_snippet': 'Built Python REST APIs and SQL ETL jobs, reducing nightly query runtime by 20%',
+                            }],
+                            'unverified_claims': [],
+                            'questions_for_candidate': ['Do you have verified Kubernetes coursework or homelab notes?'],
+                            'why_this_role': 'Built Python REST APIs and Docker CI workflows aligned with Contoso Cloud.',
+                        }),
+                    }],
+                }],
+            }
+
+        model_adapter = UnifiedModelAdapter(
+            provider='gemini',
+            api_key='TEST_GEMINI_KEY',
+            environ={},
+            env_path=None,
+            config={'llm_provider': 'gemini', 'llm_model': 'gemini-3.8-flash'},
+            transport=fake_gemini_transport,
+            sleep_fn=lambda _: None,
+        )
+        tailor_adapter = VoicePreservingTailorAdapter(model_adapter=model_adapter)
+        out = tailor_adapter.tailor(self.sample_resume, self.sample_job, mode='auto')
+
+        self.assertIsInstance(out['result'], TailoredResumeResult)
+        self.assertEqual(out['generation_mode'], 'llm')
+        self.assertEqual(out['provider'], 'gemini')
+        self.assertEqual(len(out['claim_evidence_map']), 1)
+        self.assertEqual(out['slop_warnings'], [])
+        self.assertIn('Jordan Taylor', out['ats_preview_text'])
+        self.assertEqual(len(captured_prompts), 1)
+        prompt_blob = json.dumps(captured_prompts[0])
+        self.assertIn('<UNTRUSTED_DATA', prompt_blob)
+
+        # Unconfigured key under mode='auto' falls back deterministically with honest label
+        offline_model = UnifiedModelAdapter(
+            environ={},
+            env_path=None,
+            config={'llm_provider': 'auto'},
+        )
+        offline_out = VoicePreservingTailorAdapter(model_adapter=offline_model).tailor(
+            self.sample_resume,
+            self.sample_job,
+            verified_gap_skills=['Kubernetes'],
+            mode='auto',
+        )
+        self.assertEqual(offline_out['generation_mode'], 'deterministic_no_llm')
+        self.assertIn('Kubernetes', offline_out['tailored_text'])
+
+        # Configured LLM that errors upstream MUST fail honestly rather than masking failure as LLM success
+        def failing_transport(url, headers, payload, timeout):
+            raise urllib.error.URLError('network down')
+
+        failing_model = UnifiedModelAdapter(
+            provider='gemini',
+            api_key='TEST_GEMINI_KEY',
+            environ={},
+            env_path=None,
+            config={'llm_provider': 'gemini', 'llm_model': 'gemini-3.8-flash'},
+            max_retries=0,
+            transport=failing_transport,
+            sleep_fn=lambda _: None,
+        )
+        with self.assertRaises(ModelRequestError):
+            VoicePreservingTailorAdapter(model_adapter=failing_model).tailor(
+                self.sample_resume,
+                self.sample_job,
+                mode='auto',
+            )
+
+    def test_prepare_ai_lint_export_docx_routes_and_confirmed_immutability(self):
+        schema_path = Path(__file__).resolve().parent.parent / 'schemas' / 'application.schema.json'
+        app_schema = json.loads(schema_path.read_text(encoding='utf-8'))
+        allowed_claim_keys = set(app_schema['properties']['claim_evidence_map']['items']['properties'].keys())
+
+        with db.connection() as con:
+            con.execute('UPDATE profile SET resume=? WHERE id=1', (self.sample_resume,))
+            job_id = con.execute(
+                'INSERT INTO jobs(title, company, location, description, url) VALUES(?,?,?,?,?)',
+                (
+                    self.sample_job['title'],
+                    self.sample_job['company'],
+                    self.sample_job['location'],
+                    self.sample_job['description'] + ' Requirements: ' + self.sample_job['requirements'],
+                    self.sample_job['url'],
+                ),
+            ).lastrowid
+            con.execute(
+                'INSERT INTO gap_artifacts(job_id, skill_name, gap_type, micro_project_brief, proof_url, verified) '
+                'VALUES(?,?,?,?,?,?)',
+                (job_id, 'Kubernetes', 'stack', 'Mini deployment manifest', 'https://github.com/example/k8s-lab', 1),
+            )
+
+        code_status, body_status = routes_pipeline.handle_get('/api/pipeline/status')
+        self.assertEqual(code_status, 200)
+        self.assertIn('A-04', body_status['tasks_completed'])
+        self.assertTrue(body_status['tailor_adapter']['implemented'])
+
+        # Run /api/pipeline/prepare-ai deterministically
+        code_prep, body_prep = routes_pipeline.handle_post(
+            '/api/pipeline/prepare-ai',
+            {'job_id': job_id, 'mode': 'heuristic'},
+        )
+        self.assertEqual(code_prep, 200)
+        app_id = body_prep['application']['id']
+        self.assertEqual(body_prep['generation_mode'], 'deterministic_heuristic')
+        self.assertEqual(body_prep['verified_gap_skills'], ['Kubernetes'])
+        self.assertIn('Kubernetes', body_prep['tailored_text'])
+        self.assertTrue(len(body_prep['claim_evidence_map']) >= 1)
+        for item in body_prep['claim_evidence_map']:
+            self.assertEqual(set(item.keys()), allowed_claim_keys)
+
+        # Verify persistence + sanitized audit_events
+        stored = db.row('SELECT * FROM applications WHERE id=?', (app_id,))
+        self.assertIsNotNone(stored['claim_map_json'])
+        self.assertIsNotNone(stored['slop_warnings_json'])
+        self.assertIn('Jordan Taylor', stored['ats_preview_text'])
+        self.assertEqual(stored['resume_sha256'], body_prep['resume_sha256'])
+        audits = db.rows("SELECT details_json FROM audit_events WHERE action='resume_tailored'")
+        self.assertEqual(len(audits), 1)
+        self.assertNotIn('Northwind Systems', audits[0]['details_json'])
+
+        # Re-lint sloppy manual edit and save back to draft application
+        sloppy_draft = body_prep['tailored_text'] + '\n- Spearheaded cutting-edge synergy seamlessly!'
+        code_lint, body_lint = routes_pipeline.handle_post(
+            '/api/pipeline/tailor/lint',
+            {
+                'text': sloppy_draft,
+                'job_id': job_id,
+                'application_id': app_id,
+                'save': True,
+                'claim_evidence_map': body_prep['claim_evidence_map'],
+            },
+        )
+        self.assertEqual(code_lint, 200)
+        self.assertFalse(body_lint['clean'])
+        lint_terms = {item['term'] for item in body_lint['flagged_terms']}
+        self.assertIn('spearheaded', lint_terms)
+        self.assertEqual(body_lint['application']['id'], app_id)
+
+        # Export DOCX
+        code_exp, body_exp = routes_pipeline.handle_post(f'/api/pipeline/applications/{app_id}/export-docx', {})
+        self.assertEqual(code_exp, 200)
+        raw_docx = base64.b64decode(body_exp['content_base64'])
+        self.assertTrue(zipfile.is_zipfile(io.BytesIO(raw_docx)))
+        self.assertIn('Jordan Taylor', body_exp['ats_preview_text'])
+
+        # Lock application as 'confirmed' and ensure prepare-ai / lint-save / altered export reject with 409
+        with db.connection() as con:
+            con.execute("UPDATE applications SET status='confirmed' WHERE id=?", (app_id,))
+
+        code_409_prep, _ = routes_pipeline.handle_post(
+            '/api/pipeline/prepare-ai',
+            {'job_id': job_id, 'mode': 'heuristic'},
+        )
+        self.assertEqual(code_409_prep, 409)
+
+        code_409_lint, _ = routes_pipeline.handle_post(
+            '/api/pipeline/tailor/lint',
+            {'text': 'Modified text', 'application_id': app_id, 'save': True},
+        )
+        self.assertEqual(code_409_lint, 409)
+
+        code_409_exp, _ = routes_pipeline.handle_post(
+            f'/api/pipeline/applications/{app_id}/export-docx',
+            {'text': 'Altered unconfirmed text'},
+        )
+        self.assertEqual(code_409_exp, 409)
+
+        # Unimplemented A-05 route still returns 501
+        code_501, _ = routes_pipeline.handle_post('/api/pipeline/gaps', {})
+        self.assertEqual(code_501, 501)
+
+
 if __name__ == '__main__':
     unittest.main()

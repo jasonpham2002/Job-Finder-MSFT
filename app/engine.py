@@ -13,7 +13,7 @@ import ipaddress
 import json
 import re
 import socket
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional, Sequence
 from urllib import error, parse, request
 
 STOP = set('a an the and or to for of in at on by with from as is are be this that their our your you we i it have has will can must should ability experience work working team role position job jobs company candidate including strong excellent opportunity relevant required preferred responsible responsibilities years year degree skills knowledge hands hands-on using use an into plus through'.split())
@@ -793,3 +793,177 @@ def preflight_storage_dict(preflight: Mapping[str, Any]) -> dict[str, Any]:
         'friction_roi': str(preflight.get('friction_roi', 'standard')),
         'notes': str(preflight.get('notes', '')),
     }
+
+
+# ---------------------------------------------------------------------------
+# Task A-04: Deterministic D2 Anti-Slop Linter & Claim Grounding Verifier
+# ---------------------------------------------------------------------------
+
+_AI_SLOP_RULES: tuple[tuple[str, re.Pattern[str], str], ...] = (
+    ('spearheaded', re.compile(r'\bspearhead(?:ed|ing|s)?\b', re.IGNORECASE), 'led / built / launched'),
+    ('synergistic', re.compile(r'\bsynerg(?:istic|istically|ies|y|ize|ized)?\b', re.IGNORECASE), 'collaborative / combined'),
+    ('delved', re.compile(r'\bdelv(?:e|ed|ing|s)\b', re.IGNORECASE), 'analyzed / investigated'),
+    ('orchestrated', re.compile(r'\borchestrat(?:e|ed|ing|s)\b', re.IGNORECASE), 'coordinated / ran'),
+    ('testament', re.compile(r'\btestament\b', re.IGNORECASE), 'evidence / result'),
+    ('cutting-edge', re.compile(r'\bcutting[- ]edge\b', re.IGNORECASE), 'modern (or name the exact tool)'),
+    ('dynamic professional', re.compile(r'\bdynamic\s+professional\b', re.IGNORECASE), 'actual role title + domain'),
+    ('results-driven', re.compile(r'\bresults[- ]driven\b', re.IGNORECASE), 'state measurable outcome instead'),
+    ('detail-oriented', re.compile(r'\bdetail[- ]oriented\b', re.IGNORECASE), 'show concrete accuracy/QA work instead'),
+    ('self-starter', re.compile(r'\bself[- ]starter\b', re.IGNORECASE), 'describe project initiated independently'),
+    ('best-in-class', re.compile(r'\bbest[- ]in[- ]class\b', re.IGNORECASE), 'replace hype with concrete benchmark'),
+    ('world-class', re.compile(r'\bworld[- ]class\b', re.IGNORECASE), 'replace hype with concrete scope'),
+    ('thought leader', re.compile(r'\bthought\s+leader(?:ship)?\b', re.IGNORECASE), 'cite specific talk, doc, or mentoring'),
+    ('game-changer', re.compile(r'\bgame[- ]chang(?:er|ing)\b', re.IGNORECASE), 'state specific impact instead'),
+    ('revolutionized', re.compile(r'\brevolutioniz(?:e|ed|ing|es)\b', re.IGNORECASE), 'redesigned / improved'),
+    ('leveraged', re.compile(r'\bleverag(?:e|ed|ing|es)\b', re.IGNORECASE), 'used / applied'),
+)
+
+_METRIC_TOKEN_RE = re.compile(
+    r'\$\s*\d[\d,]*(?:\.\d+)?[kKmMbB]?\b'
+    r'|\b\d+(?:\.\d+)?%'
+    r'|\b\d+(?:\.\d+)?[xX+]\b'
+    r'|\b\d[\d,]*(?:\.\d+)?\b'
+)
+_TECH_TERM_RE = re.compile(
+    r'\b(?:'
+    r'python|javascript|typescript|react|next\.js|node\.js|angular|vue|django|flask|fastapi|'
+    r'java|kotlin|swift|golang|rust|ruby|php|scala|sql|postgres(?:ql)?|mysql|sqlite|mongodb|'
+    r'redis|kafka|airflow|spark|snowflake|databricks|bigquery|dbt|tableau|power\s*bi|'
+    r'aws|gcp|azure|kubernetes|docker|terraform|ansible|jenkins|github\s*actions|'
+    r'pytorch|tensorflow|scikit-learn|langchain|graphql|grpc|salesforce|workday|sap'
+    r')\b',
+    re.IGNORECASE,
+)
+
+
+def lint_ai_slop(text: str) -> dict[str, Any]:
+    """Detect recognizable LLM/corporate clichés and suggest voice-preserving replacements."""
+    raw = str(text or '')
+    lines = raw.splitlines() or [raw]
+    flagged_terms: list[dict[str, Any]] = []
+    slop_warnings: list[str] = []
+    total_hits = 0
+
+    for label, pattern, suggestion in _AI_SLOP_RULES:
+        matches = list(pattern.finditer(raw))
+        if not matches:
+            continue
+        line_nums = [
+            idx + 1 for idx, line in enumerate(lines)
+            if pattern.search(line)
+        ]
+        count = len(matches)
+        total_hits += count
+        flagged_terms.append({
+            'term': label,
+            'count': count,
+            'suggestion': suggestion,
+            'line_numbers': line_nums,
+        })
+        line_str = ', '.join(str(n) for n in line_nums[:4])
+        slop_warnings.append(
+            f'Avoid AI/corporate cliché "{label}" ({count}x, line {line_str}) — consider "{suggestion}".'
+        )
+
+    return {
+        'slop_warnings': slop_warnings,
+        'flagged_terms': flagged_terms,
+        'slop_score': total_hits,
+        'clean': total_hits == 0,
+    }
+
+
+def _normalize_ws(text: str) -> str:
+    return re.sub(r'\s+', ' ', str(text or '').lower()).strip()
+
+
+def _extract_meaningful_metrics(text: str) -> set[str]:
+    found: set[str] = set()
+    for match in _METRIC_TOKEN_RE.findall(str(text or '')):
+        clean = re.sub(r'\s+', '', match).lower().strip(',.')
+        if not clean:
+            continue
+        # Exclude plain 4-digit calendar years (1900-2099) from synthetic metric warnings.
+        if re.fullmatch(r'(?:19|20)\d{2}', clean):
+            continue
+        # Ignore trivial single digits 1-9 unless qualified by %, $, x, or +.
+        if clean.isdigit() and int(clean) < 10:
+            continue
+        found.add(clean)
+    return found
+
+
+def verify_tailor_grounding(
+    original_resume: str,
+    tailored_text: str,
+    claim_evidence_map: Sequence[Mapping[str, str]],
+    candidate_confirmations: Optional[Mapping[str, Any]] = None,
+    verified_gap_skills: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Deterministically verify that tailored claims, metrics, and skills trace back to source facts."""
+    evidence_parts = [str(original_resume or '')]
+    if isinstance(candidate_confirmations, Mapping):
+        for k, v in candidate_confirmations.items():
+            if str(v or '').strip():
+                evidence_parts.append(f'{k}: {v}')
+    for skill in verified_gap_skills:
+        clean_skill = str(skill or '').strip()
+        if clean_skill:
+            evidence_parts.append(f'Verified Gap Project: {clean_skill}')
+
+    evidence_corpus = '\n'.join(evidence_parts)
+    norm_corpus = _normalize_ws(evidence_corpus)
+    corpus_tokens = set(re.findall(r'[a-z0-9+#.-]{3,}', norm_corpus))
+
+    verified_map: list[dict[str, str]] = []
+    unverified_claims: list[str] = []
+    questions: list[str] = []
+    seen_pairs: set[tuple[str, str]] = set()
+
+    for entry in claim_evidence_map or []:
+        if not isinstance(entry, Mapping):
+            continue
+        claim = str(entry.get('claim') or '').strip()
+        snippet = str(entry.get('source_snippet') or '').strip()
+        if not claim:
+            continue
+        norm_snippet = _normalize_ws(snippet)
+        snippet_tokens = [tok for tok in re.findall(r'[a-z0-9+#.-]{3,}', norm_snippet)]
+
+        is_grounded = False
+        if len(norm_snippet) >= 4 and norm_snippet in norm_corpus:
+            is_grounded = True
+        elif snippet_tokens:
+            overlap_ratio = sum(1 for tok in snippet_tokens if tok in corpus_tokens) / len(snippet_tokens)
+            if overlap_ratio >= 0.75:
+                is_grounded = True
+
+        if is_grounded:
+            pair = (claim, snippet)
+            if pair not in seen_pairs:
+                seen_pairs.add(pair)
+                verified_map.append({'claim': claim, 'source_snippet': snippet})
+        else:
+            unverified_claims.append(f'{claim} (unverified source snippet: {snippet or "missing"})')
+            questions.append(f'Can you verify "{claim}"? No matching snippet was found in your source resume.')
+
+    # Catch unverified quantitative metrics or dollar/percentage figures introduced in tailored_text.
+    source_metrics = _extract_meaningful_metrics(evidence_corpus)
+    tailored_metrics = _extract_meaningful_metrics(tailored_text)
+    for new_metric in sorted(tailored_metrics - source_metrics):
+        unverified_claims.append(f'New metric "{new_metric}" in tailored resume lacks source verification.')
+        questions.append(f'Please confirm metric "{new_metric}" before keeping it on your resume.')
+
+    # Catch well-known technical tools introduced in tailored_text without evidence in source corpus.
+    source_tech = {m.lower() for m in _TECH_TERM_RE.findall(evidence_corpus)}
+    tailored_tech = {m.lower() for m in _TECH_TERM_RE.findall(tailored_text)}
+    for new_tech in sorted(tailored_tech - source_tech):
+        unverified_claims.append(f'Unsupported technology "{new_tech}" detected outside verified source evidence.')
+        questions.append(f'Do you have verified hands-on experience with "{new_tech}"? Provide evidence before adding it.')
+
+    return {
+        'claim_evidence_map': verified_map,
+        'unverified_claims': list(dict.fromkeys(unverified_claims)),
+        'questions_for_candidate': list(dict.fromkeys(questions)),
+    }
+
